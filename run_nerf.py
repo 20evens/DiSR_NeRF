@@ -565,9 +565,9 @@ def config_parser():
 
     # 超分辨率预处理选项
     parser.add_argument("--sr_preprocess", action='store_true',
-                        help='先对images_8进行超分辨率，再用SR图像做三维重建')
+                        help='先对原始图像进行2x超分辨率（800→1600），再用SR图像做三维重建')
     parser.add_argument("--sr_checkpoint", type=str, default=None,
-                        help='扩散模型检查点路径，默认 ./checkpoints/final_model.pth')
+                        help='扩散模型检查点路径，默认 ./checkpoints/best_model.pth')
 
     # 日志和保存选项
     parser.add_argument("--i_print",   type=int, default=100,
@@ -603,7 +603,7 @@ def train():
             if os.path.exists(sr_imgdir) and len(os.listdir(sr_imgdir)) > 0:
                 print(f'[SR-NeRF] SR图像已存在: {sr_imgdir}，跳过')
             else:
-                print(f'[SR-NeRF] 开始对 {lr_imgdir} 进行4x超分辨率...')
+                print(f'[SR-NeRF] 开始对 {lr_imgdir} 进行2x超分辨率（800→1600）...')
                 run_sr(input_dir=lr_imgdir, output_dir=sr_imgdir,
                        checkpoint=args.sr_checkpoint, no_bicubic=True)
                 print(f'[SR-NeRF] 超分辨率完成，结果保存在: {sr_imgdir}')
@@ -618,7 +618,7 @@ def train():
                 if os.path.isdir(sr_dir) and len(os.listdir(sr_dir)) > 0:
                     print(f'[SR-NeRF] {split} SR图像已存在: {sr_dir}，跳过')
                     continue
-                print(f'[SR-NeRF] 对 {split_dir} 进行4x超分辨率...')
+                print(f'[SR-NeRF] 对 {split_dir} 进行2x超分辨率（800→1600）...')
                 run_sr(input_dir=split_dir, output_dir=sr_dir,
                        checkpoint=args.sr_checkpoint, no_bicubic=True)
                 print(f'[SR-NeRF] {split} SR完成，结果在: {sr_dir}')

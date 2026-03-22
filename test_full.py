@@ -1,19 +1,18 @@
 """
 test_full.py - 对完整测试图像进行超分辨率重建
-将 test/images_8 中的 378x378 低分辨率图像恢复为 3024x3024 高分辨率图像
+将 800×800 低分辨率图像恢复为 1600×1600 高分辨率图像（2x SR）
 
 处理流程：
-  378x378 LR
-    → 切成 32x32 小块（padding到384x384，共12x12=144块）
-    → 扩散模型每块 32x32 → 128x128（4x学习超分）
-    → 拼接为 1512x1512（378x4）
-    → 双三次插值 2x → 3024x3024（最终8x目标）
+  800×800 LR
+    → 切成 128×128 小块（50% 重叠，stride=64）
+    → 扩散模型每块 128×128 → 256×256（2x 学习超分）
+    → Gaussian 加权混合拼接为 1600×1600（800×2）
+    → 可选双三次插值 2x → 3200×3200（最终4x目标）
 
 用法：
-  python test_full.py                          # 使用 best_model.pth（默认）
-  python test_full.py --checkpoint ./checkpoints/final_model.pth
-  python test_full.py                          # 默认4x输出
-  python test_full.py --bicubic                 # 额外2x双三次插值得到8x输出
+  python test_full.py                          # 使用 best_model.pth（默认），2x输出
+  python test_full.py --checkpoint ./checkpoints/latest.pth
+  python test_full.py --bicubic                 # 额外2x双三次插值得到4x输出
 """
 
 import os
@@ -115,7 +114,7 @@ def extract_patches_for_image(lr_tensor, config):
     patch_lr  = config.lr_size
     patch_hr  = config.hr_size
     scale     = config.scale_factor
-    stride_lr = patch_lr // 2
+    stride_lr = patch_lr * 3 // 4  # 25% 重叠（vs 原50%）：patch总数减少～2x，持续圆滑混合补偿边界
 
     _, C, H_orig, W_orig = lr_tensor.shape
     half   = patch_lr // 2
@@ -198,16 +197,16 @@ def sr_full_image(model, lr_tensor, config):
     device = next(model.parameters()).device
     lr_tensor = lr_tensor.to(device)
 
-    patch_lr  = config.lr_size       # 32
-    patch_hr  = config.hr_size       # 128
-    scale     = config.scale_factor  # 4
-    stride_lr = patch_lr // 2        # 16 — 50% 重叠
-    stride_hr = stride_lr * scale    # 64
+    patch_lr  = config.lr_size       # 128
+    patch_hr  = config.hr_size       # 256
+    scale     = config.scale_factor  # 2
+    stride_lr = patch_lr * 3 // 4   # 96 — 25% 重叠（毕50%少～2x patch）
+    stride_hr = stride_lr * scale    # 192
 
     _, C, H_orig, W_orig = lr_tensor.shape
 
     # reflect padding：确保边界 patch 有足够上下文
-    half   = patch_lr // 2   # 16
+    half   = patch_lr // 2   # 64（padding 与 stride 无关，保持不变）
     padded = F.pad(lr_tensor, (half, half, half, half), mode='reflect')
     _, C, H_pad, W_pad = padded.shape
 
@@ -238,23 +237,23 @@ def sr_full_image(model, lr_tensor, config):
             positions_hr.append((y0 * scale, x0 * scale))
 
     all_patches = torch.stack(patches_list, dim=0).half()  # [total, C, lr_size, lr_size] FP16
-    print(f"  重叠patch数: {total}（stride={stride_lr}，50%重叠），DDIM步数=20")
+    print(f"  重叠patch数: {total}（stride={stride_lr}，25%重叠），DDIM步数=10")
 
     # 批量 SR 推理（显存不足自动降批）
-    BATCH = min(total, 48)   # hr=256 时显存占用适中
+    BATCH = min(total, 96)   # hr=256 + 较少patch，可提大batch
     with torch.inference_mode():
         sr_parts = []
         for start in range(0, total, BATCH):
             end = min(start + BATCH, total)
             try:
-                sr_parts.append(model.sample_ddim(all_patches[start:end], ddim_steps=20))
+                sr_parts.append(model.sample_ddim(all_patches[start:end], ddim_steps=10))
             except torch.cuda.OutOfMemoryError:
                 torch.cuda.empty_cache()
                 BATCH = max(BATCH // 2, 1)
                 print(f"\n  [OOM] batch_size 降至 {BATCH}")
                 for s in range(start, end, BATCH):
                     e = min(s + BATCH, end)
-                    sr_parts.append(model.sample_ddim(all_patches[s:e], ddim_steps=20))
+                    sr_parts.append(model.sample_ddim(all_patches[s:e], ddim_steps=10))
             print(f"\r  patch {min(end, total):3d}/{total}", end="", flush=True)
 
         sr_all = torch.cat(sr_parts, dim=0)  # [total, C, hr_size, hr_size]
@@ -288,7 +287,6 @@ def run_sr(input_dir, output_dir, checkpoint=None, no_bicubic=True, max_images=N
 
     # 加载模型
     model = DiffusionModel(config).to(config.device)
-    # ckpt = checkpoint or os.path.join(config.checkpoint_dir, "final_model.pth")
     ckpt = checkpoint or os.path.join(config.checkpoint_dir, "best_model.pth")
     if os.path.exists(ckpt):
         model, _, _ = load_checkpoint(model, None, ckpt, config.device)
@@ -343,8 +341,9 @@ def run_sr(input_dir, output_dir, checkpoint=None, no_bicubic=True, max_images=N
         image_files = image_files[:max_images]
 
     print(f"[SR] 共找到 {len(image_files)} 张图像，输入: {input_dir}")
+    final_scale = config.scale_factor if no_bicubic else config.scale_factor * 2
     print(f"[SR] 模型倍率: {config.scale_factor}x  →  最终倍率: "
-          f"{'4x（仅SR模型）' if no_bicubic else '8x（4x SR + 2x双三次）'}")
+          f"{final_scale}x（{'仅SR模型' if no_bicubic else f'{config.scale_factor}x SR + 2x双三次'}）")
     print(f"[SR] 结果保存至: {output_dir}\n")
 
     # ═══════════════════════════════════════════════════
@@ -389,85 +388,110 @@ def run_sr(input_dir, output_dir, checkpoint=None, no_bicubic=True, max_images=N
     del patches_list
 
     # ═══════════════════════════════════════════════════
-    # 阶段2/3：DDIM 推理（GPU 持续高负载）
-    # hr_size=256（2x SR），所有图像 patch 连续处理
+    # 阶段 2/3 + 3/3：分组流水线（每 SAVE_EVERY 张存储一次）
+    # 每组：DDIM 推理 → GPU Gaussian 组装 → CPU 并行保存 → 释放显存
+    # 好处：峰值内存低；无需等全部图片完成即持续写入磁盘
     # ═══════════════════════════════════════════════════
-    print(f"[SR] 阶段 2/3：DDIM 推理（DDIM 步数=20）...")
+    DDIM_STEPS = 10    # 20→10：推理 2x 加速
+    DDIM_BATCH = 128   # hr=256 + 25% 重叠，可用较大 batch
+    SAVE_EVERY = 10    # 每处理 N 张立即保存一次
 
-    DDIM_BATCH    = 64   # hr=256 + FP16，4090 24GB 安全値；OOM 时自动减半
-    sr_parts_cpu  = []
+    # 预计算每张图像 patch 在 all_patches_cpu 中的起止偏移
+    # cum[i] = 第 i 张图像 patch 的起始索引；cum[i+1] = 结束索引
+    cum = [0]
+    for n in patch_counts:
+        cum.append(cum[-1] + n)
 
-    with torch.inference_mode():
-        for start in range(0, total_patches, DDIM_BATCH):
-            end        = min(start + DDIM_BATCH, total_patches)
-            batch_gpu  = all_patches_cpu[start:end].to(config.device, dtype=torch.half)
-            try:
-                sr_batch = model.sample_ddim(batch_gpu, ddim_steps=20)
-            except torch.cuda.OutOfMemoryError:
-                torch.cuda.empty_cache()
-                DDIM_BATCH = max(DDIM_BATCH // 2, 1)
-                print(f"\n  [OOM] batch 降至 {DDIM_BATCH}，重试...")
-                sub = []
-                for s in range(start, end, DDIM_BATCH):
-                    e = min(s + DDIM_BATCH, end)
-                    sub.append(model.sample_ddim(
-                        all_patches_cpu[s:e].to(config.device, dtype=torch.half), ddim_steps=20))
-                sr_batch = torch.cat(sub, dim=0)
-            sr_parts_cpu.append(sr_batch.cpu())   # 立即转回 CPU 释放显存
-            print(f"\r  {min(end, total_patches):5d}/{total_patches} patches  "
-                  f"batch={end - start}", end="", flush=True)
+    # pin_memory：锁页内存，加速 CPU → GPU 传输
+    all_patches_cpu = all_patches_cpu.pin_memory()
 
-    print()
-    all_sr_cpu = torch.cat(sr_parts_cpu, dim=0)   # [total, C, hr_size, hr_size] CPU
-    del all_patches_cpu, sr_parts_cpu
-    torch.cuda.empty_cache()
-    print(f"  → DDIM 推理完成，SR patches 大小: "
-          f"{all_sr_cpu.element_size() * all_sr_cpu.numel() / 1e9:.2f} GB (CPU RAM)\n")
+    n_imgs  = len(img_infos)
+    saved_n = 0
 
-    # ═══════════════════════════════════════════════════
-    # 阶段3/3：GPU 组装（串行）+ CPU 后处理与保存（并行）
-    # GPU 组装（Gaussian混合）串行以避免显存竞争；
-    # color_match / denoise_sr / save 并行执行（释放 GIL）
-    # ═══════════════════════════════════════════════════
-    print(f"[SR] 阶段 3/3：组装 + 后处理 + 保存...")
-
-    # 先串行做 GPU Gaussian 混合组装，结果存为 CPU tensor
-    offset        = 0
-    assembled     = []   # (img_path, lr_np, sr_tensor_cpu)
-    for i, ((img_path, lr_np, meta), n) in enumerate(zip(img_infos, patch_counts)):
-        sr_patches_gpu = all_sr_cpu[offset:offset + n].to(config.device)
-        offset += n
-        sr_cpu = assemble_sr_image(sr_patches_gpu, meta, config.device)
-        assembled.append((img_path, lr_np, sr_cpu))
-        print(f"\r  组装: {i+1}/{len(img_infos)}", end="", flush=True)
-
-    print()
-    del all_sr_cpu
-    torch.cuda.empty_cache()
-
-    # 并行 CPU 后处理：双三次插值（CPU）+ 颜色校正 + 去噪 + 保存
+    # ── 后处理 + 写磁盘（并行 CPU）──────────────────────────────
     def _postprocess_and_save(args):
-        i, img_path, lr_np, sr_cpu = args
+        g_idx, img_path, lr_np, sr_cpu = args
         if not no_bicubic:
             _, _, h4, w4 = sr_cpu.shape
             sr_cpu = F.interpolate(
                 sr_cpu, size=(h4 * 2, w4 * 2),
-                mode='bicubic', align_corners=False
-            )
+                mode='bicubic', align_corners=False)
         sr_np = np.clip(
-            (sr_cpu[0].numpy() * 0.5 + 0.5).transpose(1, 2, 0), 0, 1
-        )
+            (sr_cpu[0].numpy() * 0.5 + 0.5).transpose(1, 2, 0), 0, 1)
         sr_np = color_match(sr_np, lr_np)
         sr_np = denoise_sr(sr_np)
         sr_path = os.path.join(output_dir, os.path.basename(img_path))
         Image.fromarray((sr_np * 255).astype(np.uint8)).save(sr_path)
         name = os.path.splitext(os.path.basename(img_path))[0]
-        print(f"  [{i+1}/{len(assembled)}] {name} → 已保存")
+        print(f"  [{g_idx + 1}/{n_imgs}] {name} → 已保存")
 
-    tasks = [(i, p, n, t) for i, (p, n, t) in enumerate(assembled)]
-    with ThreadPoolExecutor(max_workers=min(4, len(tasks))) as pool:
-        list(pool.map(_postprocess_and_save, tasks))
+    # ── 分组主循环 ───────────────────────────────────────────────
+    for g_start in range(0, n_imgs, SAVE_EVERY):
+        g_end   = min(g_start + SAVE_EVERY, n_imgs)
+        g_size  = g_end - g_start
+        p_start = cum[g_start]
+        p_end   = cum[g_end]
+        g_total = p_end - p_start
 
+        print(f"\n[SR] 阶段 2/3：图像 {g_start + 1}–{g_end}/{n_imgs}"
+              f"（{g_total} patches，DDIM 步数={DDIM_STEPS}）...")
+
+        # ── DDIM 推理（仅当前组的 patches）─────────────────────
+        group_patches = all_patches_cpu[p_start:p_end]
+        sr_parts      = []
+        batch         = DDIM_BATCH
+        s             = 0
+        with torch.inference_mode():
+            while s < g_total:
+                e    = min(s + batch, g_total)
+                bgpu = group_patches[s:e].to(
+                    config.device, dtype=torch.half, non_blocking=True)
+                try:
+                    sr_b = model.sample_ddim(bgpu, ddim_steps=DDIM_STEPS)
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
+                    batch = max(batch // 2, 1)
+                    print(f"\n  [OOM] batch 降至 {batch}，重试...")
+                    continue    # 重试相同的 s
+                sr_parts.append(sr_b.cpu())
+                print(f"\r  patch {min(e, g_total):4d}/{g_total}  batch={e - s}",
+                      end="", flush=True)
+                s = e
+
+        print()
+        group_sr_cpu = torch.cat(sr_parts, dim=0)   # [g_total, C, hr, hr] CPU
+        del sr_parts
+        torch.cuda.empty_cache()
+
+        # ── GPU Gaussian 混合组装（串行避免显存竞争）─────────────
+        print(f"[SR] 阶段 3/3：组装图像 {g_start + 1}–{g_end}...")
+        assembled = []
+        offset    = 0
+        for i in range(g_size):
+            n_p        = patch_counts[g_start + i]
+            sr_patches = group_sr_cpu[offset:offset + n_p].to(config.device)
+            offset    += n_p
+            sr_cpu     = assemble_sr_image(
+                sr_patches, img_infos[g_start + i][2], config.device)
+            assembled.append((g_start + i,
+                               img_infos[g_start + i][0],
+                               img_infos[g_start + i][1],
+                               sr_cpu))
+            print(f"\r  组装: {i + 1}/{g_size}", end="", flush=True)
+
+        print()
+        del group_sr_cpu
+        torch.cuda.empty_cache()
+
+        # ── 并行 CPU 后处理 + 写磁盘 ────────────────────────────
+        with ThreadPoolExecutor(max_workers=min(4, g_size)) as pool:
+            list(pool.map(_postprocess_and_save, assembled))
+
+        saved_n += g_size
+        del assembled
+        print(f"  → 已累计保存 {saved_n}/{n_imgs} 张")
+
+    del all_patches_cpu
     print(f"\n[SR] 完成！共处理 {len(image_files)} 张图像，结果在: {output_dir}")
     return len(image_files)
 
@@ -520,23 +544,22 @@ def run_sr_blender_splits(basedir, checkpoint=None, no_bicubic=True,
 
 
 def main():
-    parser = argparse.ArgumentParser(description="完整图像超分辨率重建（378→3024）")
+    parser = argparse.ArgumentParser(description="完整图像超分辨率重建（800→1600，2x SR）")
     parser.add_argument("--checkpoint", type=str, default=None,
-                        # help="检查点路径，默认使用 final_model.pth")
                         help="检查点路径，默认使用 best_model.pth")
     parser.add_argument("--bicubic", action="store_true",
-                        help="额外做2x双三次插值到8x结果（默认仅输出4x SR）")
+                        help="额外做2x双三次插值到4x结果（默认仅输出2x SR：1600×1600）")
     parser.add_argument("--max_images", type=int, default=None,
                         help="最多处理几张图像，默认处理全部")
     parser.add_argument("--input_dir", type=str, default=None,
                         help="输入图像目录（默认使用config中的test_dir）")
     parser.add_argument("--output_dir", type=str, default=None,
-                        help="输出目录（默认 results/sr_full_3024）")
+                        help="输出目录（默认 results/sr_full_1600）")
     args = parser.parse_args()
 
     config = Config()
     input_dir = args.input_dir or os.path.join(config.data_root, config.test_dir)
-    output_dir = args.output_dir or os.path.join(config.result_dir, "sr_full_3024")
+    output_dir = args.output_dir or os.path.join(config.result_dir, "sr_full_1600")
 
     run_sr(input_dir, output_dir,
            checkpoint=args.checkpoint,

@@ -1,0 +1,568 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NeRF SR Studio</title>
+  <!-- Tailwind CSS (CDN Play - no build needed) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            primary: { 600: '#4f46e5', 700: '#4338ca' }
+          }
+        }
+      }
+    }
+  </script>
+  <!-- React + ReactDOM -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <!-- Babel for in-browser JSX -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    body { margin: 0; font-family: system-ui, sans-serif; background: #f1f5f9; }
+    .log-terminal { font-family: 'Consolas','Monaco','Courier New',monospace; font-size:0.78rem; line-height:1.6; }
+    .log-scroll::-webkit-scrollbar { width:6px }
+    .log-scroll::-webkit-scrollbar-track { background:#1e1e2e }
+    .log-scroll::-webkit-scrollbar-thumb { background:#44475a; border-radius:3px }
+    @keyframes spin { to { transform:rotate(360deg) } }
+    .spin { animation: spin 1s linear infinite; display:inline-block }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+/* ══════════════════════════════════════════════════════════════
+   API Client
+══════════════════════════════════════════════════════════════ */
+const BASE = 'http://localhost:8000';
+
+function getToken() { return localStorage.getItem('token') || ''; }
+
+async function req(method, path, body) {
+  const res = await fetch(BASE + path, {
+    method,
+    headers: { Authorization: `Bearer ${getToken()}`, 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+  return data;
+}
+
+const api = {
+  register:   (u, p)  => req('POST', '/auth/register', { username:u, password:p }),
+  login:      (u, p)  => req('POST', '/auth/login',    { username:u, password:p }),
+  browse:     (path)  => req('GET', `/files/browse?path=${encodeURIComponent(path)}`),
+  preview:    (path)  => req('GET', `/files/preview?path=${encodeURIComponent(path)}`),
+  findVideo:  (path)  => req('GET', `/files/find_video?path=${encodeURIComponent(path)}`),
+  runProcess: (body)  => req('POST', '/process/run', body),
+  streamLogs: (id)    => new EventSource(`${BASE}/process/logs/${id}?token=${encodeURIComponent(getToken())}`),
+};
+
+/* ══════════════════════════════════════════════════════════════
+   Auth Page
+══════════════════════════════════════════════════════════════ */
+function AuthPage({ onLogin }) {
+  const [tab, setTab]       = useState('login');
+  const [form, setForm]     = useState({ username:'', password:'', confirm:'' });
+  const [error, setError]   = useState('');
+  const [ok, setOk]         = useState('');
+  const [loading, setLoad]  = useState(false);
+
+  const set = (k, v) => { setForm(f=>({...f,[k]:v})); setError(''); setOk(''); };
+
+  async function submit(e) {
+    e.preventDefault();
+    if (!form.username.trim()) return setError('用户名不能为空');
+    if (!form.password)        return setError('密码不能为空');
+    if (tab==='register') {
+      if (!form.confirm)                  return setError('请确认密码');
+      if (form.password!==form.confirm)   return setError('两次密码不一致');
+    }
+    setLoad(true);
+    try {
+      if (tab==='register') {
+        await api.register(form.username.trim(), form.password);
+        setOk('注册成功，请登录'); setTab('login');
+        setForm(f=>({...f,password:'',confirm:''}));
+      } else {
+        const d = await api.login(form.username.trim(), form.password);
+        localStorage.setItem('token', d.access_token);
+        localStorage.setItem('username', d.username);
+        onLogin(d.username);
+      }
+    } catch(err) { setError(err.message); }
+    finally { setLoad(false); }
+  }
+
+  const isLogin = tab==='login';
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-indigo-50 via-white to-purple-50 flex items-center justify-center p-4">
+      <div className="w-full max-w-md">
+        <div className="text-center mb-8">
+          <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-indigo-600 text-white text-3xl mb-4 shadow-lg">🎬</div>
+          <h1 className="text-3xl font-bold text-gray-900">NeRF SR Studio</h1>
+          <p className="text-gray-500 mt-1 text-sm">超分辨率 · 三维重建一体化平台</p>
+        </div>
+        <div className="bg-white rounded-2xl shadow-xl p-8">
+          <h2 className="text-xl font-semibold text-gray-800 mb-6">{isLogin ? '登录账号' : '创建账号'}</h2>
+          {ok    && <div className="mb-4 px-4 py-3 rounded-lg bg-green-50 border border-green-200 text-green-700 text-sm">✅ {ok}</div>}
+          {error && <div className="mb-4 px-4 py-3 rounded-lg bg-red-50 border border-red-200 text-red-600 text-sm">⚠️ {error}</div>}
+          <form onSubmit={submit} className="space-y-4">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">用户名 <span className="text-red-400">*</span></label>
+              <input type="text" value={form.username} onChange={e=>set('username',e.target.value)}
+                placeholder="请输入用户名" autoFocus
+                className="w-full px-4 py-2.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">密码 <span className="text-red-400">*</span></label>
+              <input type="password" value={form.password} onChange={e=>set('password',e.target.value)}
+                placeholder="请输入密码"
+                className="w-full px-4 py-2.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+            </div>
+            {!isLogin && (
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">确认密码 <span className="text-red-400">*</span></label>
+                <input type="password" value={form.confirm} onChange={e=>set('confirm',e.target.value)}
+                  placeholder="再次输入密码"
+                  className="w-full px-4 py-2.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+              </div>
+            )}
+            <button type="submit" disabled={loading}
+              className="w-full py-2.5 bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-300 text-white font-medium rounded-lg text-sm transition">
+              {loading ? '处理中…' : (isLogin ? '登录' : '注册')}
+            </button>
+          </form>
+          <div className="mt-5 text-center text-sm text-gray-500">
+            {isLogin
+              ? <>还没有账号？ <button onClick={()=>{setTab('register');setError('');setOk('');}} className="text-indigo-600 hover:underline font-medium">注册</button></>
+              : <>已有账号？ <button onClick={()=>{setTab('login');setError('');setOk('');}} className="text-indigo-600 hover:underline font-medium">返回登录</button></>
+            }
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════
+   File Browser Modal
+══════════════════════════════════════════════════════════════ */
+function FileBrowser({ open, onClose, onSelect }) {
+  const [cur, setCur]     = useState('');
+  const [entries, setEnt] = useState([]);
+  const [parent, setPar]  = useState(null);
+  const [loading, setLd]  = useState(false);
+  const [err, setErr]     = useState('');
+
+  const load = useCallback(async (path='') => {
+    setLd(true); setErr('');
+    try {
+      const d = await api.browse(path);
+      setCur(d.current); setPar(d.parent); setEnt(d.entries);
+    } catch(e) { setErr(e.message); }
+    finally { setLd(false); }
+  }, []);
+
+  useEffect(() => { if(open) load(''); }, [open]);
+
+  if (!open) return null;
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-40">
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg max-h-96 flex flex-col" style={{maxHeight:'70vh'}}>
+        <div className="flex items-center justify-between px-5 py-4 border-b">
+          <h3 className="font-semibold text-gray-800">📁 浏览文件夹</h3>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600 text-2xl leading-none">×</button>
+        </div>
+        <div className="px-5 py-2 bg-gray-50 text-xs text-gray-500 font-mono border-b truncate">{cur || '根目录'}</div>
+        <div className="overflow-y-auto flex-1 px-3 py-2">
+          {loading && <p className="text-center py-8 text-gray-400 text-sm">加载中…</p>}
+          {err     && <p className="text-center py-4 text-red-500 text-sm">{err}</p>}
+          {!loading && !err && (
+            <ul className="space-y-0.5">
+              {parent && (
+                <li><button onClick={()=>load(parent)}
+                  className="w-full text-left px-3 py-2 rounded-lg hover:bg-gray-100 text-sm flex items-center gap-2 text-blue-500">
+                  ⬆ 上级目录
+                </button></li>
+              )}
+              {entries.map(e => (
+                <li key={e.path}>
+                  <button onClick={()=>e.is_dir?load(e.path):undefined}
+                    className={`w-full text-left px-3 py-2 rounded-lg text-sm flex items-center gap-2 transition ${e.is_dir?'hover:bg-indigo-50 text-gray-800':'text-gray-400 cursor-default'}`}>
+                    {e.is_dir?'📁':'📄'} {e.name}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+        <div className="px-5 py-3 border-t flex items-center gap-3">
+          <span className="flex-1 text-xs text-gray-500 font-mono truncate">{cur}</span>
+          <button onClick={()=>{onSelect(cur);onClose();}} disabled={!cur}
+            className="px-4 py-1.5 bg-indigo-600 text-white text-sm rounded-lg hover:bg-indigo-700 disabled:opacity-40 transition">
+            选择此文件夹
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════
+   Image Preview
+══════════════════════════════════════════════════════════════ */
+function PreviewGrid({ path }) {
+  const [images, setImgs] = useState([]);
+  const [loading, setLd]  = useState(false);
+  const [msg, setMsg]     = useState('');
+
+  async function load() {
+    if (!path) return setMsg('请先选择数据集目录');
+    setLd(true); setImgs([]); setMsg('');
+    try {
+      const d = await api.preview(path);
+      if (d.images.length===0) setMsg('未找到图像文件');
+      else setImgs(d.images);
+    } catch(e) { setMsg(e.message); }
+    finally { setLd(false); }
+  }
+
+  return (
+    <div className="mt-2">
+      <button onClick={load} className="text-xs text-indigo-600 hover:underline">🖼 预览数据集（前6张）</button>
+      {loading && <p className="text-xs text-gray-400 mt-1">加载中…</p>}
+      {msg     && <p className="text-xs text-gray-400 mt-1">{msg}</p>}
+      {images.length>0 && (
+        <div className="mt-2 grid grid-cols-3 gap-1.5">
+          {images.map(img => (
+            <div key={img.name} className="relative rounded-md overflow-hidden border border-gray-200 bg-gray-50" style={{paddingTop:'75%'}}>
+              <img src={img.data} alt={img.name} className="absolute inset-0 w-full h-full object-cover"/>
+              <span className="absolute bottom-0 left-0 right-0 bg-black bg-opacity-50 text-white px-1 truncate" style={{fontSize:'10px'}}>{img.name}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════
+   Progress Bar
+══════════════════════════════════════════════════════════════ */
+function ProgressBar({ value }) {
+  const pct = Math.min(100, Math.max(0, value));
+  return (
+    <div className="w-full bg-gray-200 rounded-full overflow-hidden" style={{height:'10px'}}>
+      <div className="h-full rounded-full transition-all duration-500"
+        style={{width:`${pct}%`, background:'linear-gradient(90deg,#6366f1,#a855f7)'}}/>
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════
+   Dashboard
+══════════════════════════════════════════════════════════════ */
+function Dashboard({ username, onLogout }) {
+  const [mode,       setMode]      = useState('sr_nerf');
+  const [inputDir,   setInputDir]  = useState('');
+  const [outputDir,  setOutDir]    = useState('');
+  const [autoOut,    setAutoOut]   = useState(true);
+  const [advOpen,    setAdvOpen]   = useState(false);
+  const [ddimSteps,  setDdim]      = useState(10);
+  const [nerfIters,  setIters]     = useState(200000);
+  const [srScale,    setScale]     = useState('2x');
+
+  const [browserOpen,   setBrowserOpen]   = useState(false);
+  const [browserTarget, setBrowserTarget] = useState('input');
+
+  const [status,    setStatus]   = useState('idle');
+  const [progress,  setProgress] = useState(0);
+  const [logs,      setLogs]     = useState([]);
+  const [videoPath, setVideo]    = useState(null);
+  const [jobErr,    setJobErr]   = useState('');
+
+  const logRef = useRef(null);
+  const esRef  = useRef(null);
+
+  // Auto-scroll
+  useEffect(()=>{
+    if(logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+  },[logs]);
+
+  // Cleanup SSE
+  useEffect(()=>()=>esRef.current?.close(),[]);
+
+  // Auto output path
+  useEffect(()=>{
+    if(autoOut && inputDir) {
+      const ts   = new Date().toISOString().slice(0,16).replace('T','_').replace(':','-');
+      const base = inputDir.replace(/\\/g,'/').split('/').filter(Boolean).pop() || 'output';
+      setOutDir(`./results/${base}_${mode}_${ts}`);
+    }
+  },[autoOut, inputDir, mode]);
+
+  function openBrowser(target) { setBrowserTarget(target); setBrowserOpen(true); }
+  function handleBrowserSelect(path) {
+    if(browserTarget==='input') setInputDir(path);
+    else { setOutDir(path); setAutoOut(false); }
+  }
+
+  async function handleStart() {
+    if(!inputDir.trim())  return alert('请输入数据集目录');
+    if(!outputDir.trim()) return alert('请输入结果目录');
+    setLogs([]); setProgress(0); setVideo(null); setJobErr(''); setStatus('running');
+    try {
+      const d = await api.runProcess({ mode, input_dir:inputDir, output_dir:outputDir,
+        ddim_steps:ddimSteps, nerf_iters:nerfIters, sr_scale:srScale });
+      startSSE(d.job_id);
+    } catch(e) { setStatus('error'); setJobErr(e.message); setLogs([`[错误] ${e.message}`]); }
+  }
+
+  function startSSE(id) {
+    esRef.current?.close();
+    const es = api.streamLogs(id);
+    esRef.current = es;
+    es.onmessage = (e) => {
+      const msg = JSON.parse(e.data);
+      if(msg.type==='log') {
+        setLogs(p=>[...p, msg.data]);
+        setProgress(msg.progress||0);
+      } else if(msg.type==='done') {
+        setProgress(msg.progress||100);
+        setStatus(msg.success?'done':'error');
+        es.close();
+        if(msg.success && msg.video_path) setVideo(msg.video_path);
+        else if(msg.success) api.findVideo(outputDir).then(r=>{ if(r.path) setVideo(r.path); }).catch(()=>{});
+      }
+    };
+    es.onerror = ()=>{ setStatus('error'); setLogs(p=>[...p,'[连接断开] SSE 连接已中断']); es.close(); };
+  }
+
+  function handleRerun() {
+    esRef.current?.close();
+    setStatus('idle'); setProgress(0); setLogs([]); setVideo(null); setJobErr('');
+  }
+
+  const isRunning = status==='running';
+  const isDone    = status==='done'||status==='error';
+
+  const modeOpts = [
+    {value:'sr',      label:'图像超分辨率',        icon:'🔍'},
+    {value:'nerf',    label:'三维重建',             icon:'🏗'},
+    {value:'sr_nerf', label:'超分辨率 + 三维重建',  icon:'⚡'},
+  ];
+
+  const statusColors = { idle:'bg-gray-100 text-gray-500', running:'bg-blue-100 text-blue-600', done:'bg-green-100 text-green-700', error:'bg-red-100 text-red-600' };
+  const statusLabels = { idle:'待机', running:'运行中', done:'完成', error:'错误' };
+
+  return (
+    <div className="flex flex-col" style={{minHeight:'100vh'}}>
+      {/* Nav */}
+      <nav className="bg-white border-b border-gray-200 px-6 py-3 flex items-center justify-between shadow-sm" style={{position:'sticky',top:0,zIndex:40}}>
+        <div className="flex items-center gap-3">
+          <span className="text-xl">🎬</span>
+          <span className="font-bold text-gray-800 text-lg">NeRF SR Studio</span>
+        </div>
+        <div className="flex items-center gap-4">
+          <span className="text-sm text-gray-500">👤 {username}</span>
+          <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${statusColors[status]}`}>
+            {status==='running'&&<span className="mr-1">●</span>}{statusLabels[status]}
+          </span>
+          <button onClick={onLogout} className="text-sm text-gray-500 hover:text-red-500 transition">退出</button>
+        </div>
+      </nav>
+
+      {/* Body */}
+      <div className="flex flex-1" style={{height:'calc(100vh - 57px)'}}>
+
+        {/* LEFT 35% */}
+        <aside className="bg-white border-r border-gray-200 overflow-y-auto p-5 flex flex-col gap-5" style={{width:'35%',minWidth:'280px'}}>
+
+          {/* Advanced settings */}
+          <div className="border border-gray-200 rounded-xl overflow-hidden">
+            <button onClick={()=>setAdvOpen(o=>!o)}
+              className="w-full flex items-center justify-between px-4 py-3 text-sm font-medium text-gray-700 hover:bg-gray-50 transition">
+              <span>⚙ 高级参数设置</span>
+              <span className="text-gray-400">{advOpen?'▲':'▼'}</span>
+            </button>
+            {advOpen && (
+              <div className="px-4 pb-4 pt-2 space-y-3 border-t border-gray-100">
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">超分模型倍率 <span className="text-gray-400 font-normal">(取决于已训练的模型)</span></label>
+                  <div className="flex gap-2">
+                    {['2x','4x'].map(v=>(
+                      <button key={v} onClick={()=>setScale(v)}
+                        className={`flex-1 py-1.5 rounded-lg text-xs border font-medium transition ${srScale===v?'bg-indigo-600 border-indigo-600 text-white':'border-gray-300 text-gray-600 hover:border-indigo-400'}`}>
+                        {v}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">DDIM 步数 <span className="text-gray-400 font-normal">(越少越快)</span></label>
+                  <input type="number" min={1} max={1000} value={ddimSteps} onChange={e=>setDdim(Number(e.target.value))}
+                    className="w-full px-3 py-1.5 border border-gray-300 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-indigo-400"/>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">NeRF 训练迭代次数</label>
+                  <input type="number" min={1000} max={1000000} step={10000} value={nerfIters} onChange={e=>setIters(Number(e.target.value))}
+                    className="w-full px-3 py-1.5 border border-gray-300 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-indigo-400"/>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Mode */}
+          <div>
+            <p className="text-xs font-medium text-gray-600 mb-2">运行模式</p>
+            <div className="space-y-2">
+              {modeOpts.map(opt=>(
+                <label key={opt.value}
+                  className={`flex items-center gap-3 px-3 py-2.5 rounded-xl border cursor-pointer transition ${mode===opt.value?'border-indigo-500 bg-indigo-50':'border-gray-200 hover:border-indigo-300'}`}>
+                  <input type="radio" name="mode" value={opt.value} checked={mode===opt.value} onChange={()=>setMode(opt.value)} className="accent-indigo-600"/>
+                  <span className="text-lg">{opt.icon}</span>
+                  <span className="text-sm text-gray-700 font-medium">{opt.label}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+
+          {/* Dataset dir */}
+          <div>
+            <label className="block text-xs font-medium text-gray-600 mb-1">数据集目录</label>
+            <div className="flex gap-2">
+              <input type="text" value={inputDir} onChange={e=>setInputDir(e.target.value)} placeholder="选择或输入数据集路径…"
+                className="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-indigo-400"/>
+              <button onClick={()=>openBrowser('input')}
+                className="px-3 py-2 border border-gray-300 rounded-lg text-xs hover:bg-gray-50 whitespace-nowrap">📁 浏览</button>
+            </div>
+            <PreviewGrid path={inputDir}/>
+          </div>
+
+          {/* Output dir */}
+          <div>
+            <label className="block text-xs font-medium text-gray-600 mb-1">结果存放路径</label>
+            <div className="flex gap-2">
+              <input type="text" value={outputDir} onChange={e=>{setOutDir(e.target.value);setAutoOut(false);}} placeholder="选择或输入输出路径…"
+                className="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-indigo-400"/>
+              <button onClick={()=>openBrowser('output')}
+                className="px-3 py-2 border border-gray-300 rounded-lg text-xs hover:bg-gray-50 whitespace-nowrap">📁 浏览</button>
+            </div>
+            <label className="flex items-center gap-2 mt-1.5 cursor-pointer">
+              <input type="checkbox" checked={autoOut} onChange={e=>setAutoOut(e.target.checked)} className="accent-indigo-600"/>
+              <span className="text-xs text-gray-500">自动生成路径</span>
+            </label>
+          </div>
+
+          {/* Start */}
+          <button onClick={handleStart} disabled={isRunning}
+            className={`w-full py-3 rounded-xl font-semibold text-sm transition ${isRunning?'bg-gray-200 text-gray-400 cursor-not-allowed':'bg-indigo-600 hover:bg-indigo-700 text-white shadow-md'}`}>
+            {isRunning?'⏳ 运行中…':'▶ 开始运行'}
+          </button>
+        </aside>
+
+        {/* RIGHT 65% */}
+        <main className="flex-1 flex flex-col overflow-hidden bg-gray-50 p-4 gap-3">
+
+          {/* Progress */}
+          {(isRunning||isDone) && (
+            <div className="bg-white rounded-xl p-4 shadow-sm border border-gray-200">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-sm font-medium text-gray-700">
+                  {isRunning?'处理进度':(status==='done'?'✅ 处理完成':'❌ 处理失败')}
+                </span>
+                <span className="text-sm font-mono text-indigo-600">{Math.round(progress)}%</span>
+              </div>
+              <ProgressBar value={progress}/>
+              {isRunning && (
+                <p className="text-xs text-gray-400 mt-1.5">
+                  {progress<20?'超分辨率阶段…':progress<90?'NeRF 三维重建…':'渲染结果…'}
+                </p>
+              )}
+              {jobErr && <p className="text-xs text-red-500 mt-1">{jobErr}</p>}
+            </div>
+          )}
+
+          {/* Log terminal */}
+          <div className="flex flex-col rounded-xl shadow-sm border border-gray-700 overflow-hidden" style={{flex:1,background:'#1e1e2e',minHeight:0}}>
+            <div className="flex items-center justify-between px-4 py-2 border-b border-gray-700" style={{background:'#181825'}}>
+              <span className="text-xs text-gray-400 font-mono">📋 实时日志</span>
+              {logs.length>0 && <button onClick={()=>setLogs([])} className="text-xs text-gray-500 hover:text-gray-300">清空</button>}
+            </div>
+            <div ref={logRef} className="flex-1 overflow-y-auto p-4 log-terminal log-scroll">
+              {logs.length===0
+                ? <p className="text-xs" style={{color:'#6b7280'}}>等待运行…</p>
+                : logs.map((line,i)=>(
+                  <div key={i} className="whitespace-pre-wrap break-all text-xs leading-relaxed"
+                    style={{color: line.startsWith('[错误]')||line.startsWith('[异常]')||line.startsWith('[OOM]') ? '#f87171'
+                              : line.startsWith('[完成]') ? '#4ade80'
+                              : line.startsWith('[启动]')||line.startsWith('[SR]') ? '#93c5fd'
+                              : '#d1d5db'}}>
+                    {line}
+                  </div>
+                ))
+              }
+            </div>
+          </div>
+
+          {/* Video player */}
+          {videoPath && (
+            <div className="bg-white rounded-xl p-4 shadow-sm border border-gray-200">
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="font-semibold text-gray-800 text-sm">🎬 三维重建结果</h3>
+                <span className="text-xs text-gray-400 font-mono truncate max-w-xs">{videoPath}</span>
+              </div>
+              <video controls autoPlay loop className="w-full rounded-lg bg-black" style={{maxHeight:'260px'}}
+                src={`${BASE}/files/video?path=${encodeURIComponent(videoPath)}`}>
+                您的浏览器不支持 HTML5 视频
+              </video>
+            </div>
+          )}
+
+          {/* Re-run */}
+          {isDone && (
+            <div className="flex justify-end">
+              <button onClick={handleRerun}
+                className="px-5 py-2 border-2 border-indigo-500 text-indigo-600 hover:bg-indigo-50 rounded-xl text-sm font-medium transition">
+                ↺ 重新运行
+              </button>
+            </div>
+          )}
+        </main>
+      </div>
+
+      <FileBrowser open={browserOpen} onClose={()=>setBrowserOpen(false)} onSelect={handleBrowserSelect}/>
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════
+   App Root
+══════════════════════════════════════════════════════════════ */
+function App() {
+  const [username, setUsername] = useState(()=>localStorage.getItem('username'));
+
+  function handleLogin(u) { setUsername(u); }
+  function handleLogout() {
+    localStorage.removeItem('token');
+    localStorage.removeItem('username');
+    setUsername(null);
+  }
+
+  if(!username) return <AuthPage onLogin={handleLogin}/>;
+  return <Dashboard username={username} onLogout={handleLogout}/>;
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>

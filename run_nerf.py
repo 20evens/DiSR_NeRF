@@ -19,12 +19,35 @@ from load_llff import load_llff_data
 from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data
 from load_LINEMOD import load_LINEMOD_data
+from nerf_metrics import evaluate_nerf_metrics
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.backends.cudnn.benchmark = True   # 自动选择最快算法，NeRF网络结构固定，首次略慢后续加速
 np.random.seed(0)
 DEBUG = False
 
 #python run_nerf.py --config configs/lego.txt
+
+
+def _downsample_blender_split(src_dir, dst_dir, scale=2):
+    """将 blender split 目录中的 PNG 图像下采样 scale 倍后保存到 dst_dir。
+    用于 half_res+sr_preprocess 联合流程：先降分辨率再送入 SR 模型。
+    """
+    from PIL import Image as _PILImage
+    os.makedirs(dst_dir, exist_ok=True)
+    png_files = sorted(f for f in os.listdir(src_dir) if f.lower().endswith('.png'))
+    if not png_files:
+        print(f'  [警告] {src_dir} 中未找到 PNG 文件')
+        return
+    for fname in png_files:
+        img = imageio.imread(os.path.join(src_dir, fname))   # RGBA uint8
+        H, W = img.shape[:2]
+        new_W, new_H = W // scale, H // scale
+        pil_img = _PILImage.fromarray(img)
+        pil_ds  = pil_img.resize((new_W, new_H), _PILImage.LANCZOS)
+        imageio.imwrite(os.path.join(dst_dir, fname), np.array(pil_ds))
+    print(f'  → {len(png_files)} 张图像下采样 {scale}× 至 {new_W}×{new_H}，保存在: {dst_dir}')
+
 
 def batchify(fn, chunk):
     # 构建一个适用于较小批量处理的“fn”版本
@@ -296,6 +319,12 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
         weights: [num_rays, num_samples]. 每个采样点的权重
         depth_map: [num_rays]. 深度图
     """
+    # AMP 安全：体积渲染（exp/cumprod/1e-10 epsilon）需要 FP32 精度
+    # MLP 前向已在 FP16 加速，此处转回 FP32 保证数值稳定
+    raw    = raw.float()
+    z_vals = z_vals.float()
+    rays_d = rays_d.float()
+
     raw2alpha = lambda raw, dists, act_fn=F.relu: 1.-torch.exp(-act_fn(raw)*dists)
 
     # 计算采样点之间的距离
@@ -326,7 +355,8 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3] # 加权求和得到颜色
 
     depth_map = torch.sum(weights * z_vals, -1) # 加权平均得到深度
-    disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1))
+    depth_sum = torch.sum(weights, -1).clamp(min=1e-10)   # 防止背景光线 0/0 → NaN
+    disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map / depth_sum)
     acc_map = torch.sum(weights, -1) # 累积权重（总不透明度）
 
     # 处理白色背景
@@ -489,9 +519,9 @@ def config_parser():
     parser.add_argument("--lrate_decay", type=int, default=250,
                         help='exponential learning rate decay (in 1000 steps)')
     # 内存优化选项
-    parser.add_argument("--chunk", type=int, default=1024*32,
+    parser.add_argument("--chunk", type=int, default=1024*64,
                         help='number of rays processed in parallel, decrease if running out of memory')
-    parser.add_argument("--netchunk", type=int, default=1024*64,
+    parser.add_argument("--netchunk", type=int, default=1024*256,
                         help='number of pts sent through network in parallel, decrease if running out of memory')
 
     parser.add_argument("--no_batching", action='store_true',
@@ -618,10 +648,21 @@ def train():
                 if os.path.isdir(sr_dir) and len(os.listdir(sr_dir)) > 0:
                     print(f'[SR-NeRF] {split} SR图像已存在: {sr_dir}，跳过')
                     continue
-                print(f'[SR-NeRF] 对 {split_dir} 进行2x超分辨率（800→1600）...')
-                run_sr(input_dir=split_dir, output_dir=sr_dir,
-                       checkpoint=args.sr_checkpoint, no_bicubic=True)
-                print(f'[SR-NeRF] {split} SR完成，结果在: {sr_dir}')
+                if args.half_res:
+                    # half_res+sr_preprocess：800→400（下采样）→800（SR）
+                    # NeRF 最终以 800×800 SR 图像训练，焦距与原始 800 分辨率一致
+                    lr_dir = os.path.join(args.datadir, split + '_lr')
+                    if not (os.path.isdir(lr_dir) and len(os.listdir(lr_dir)) > 0):
+                        print(f'[SR-NeRF] {split}: 生成 400×400 下采样图像 → {lr_dir}...')
+                        _downsample_blender_split(split_dir, lr_dir, scale=2)
+                    print(f'[SR-NeRF] {split}: 对 {lr_dir} 进行 2x SR（400→800）...')
+                    run_sr(input_dir=lr_dir, output_dir=sr_dir,
+                           checkpoint=args.sr_checkpoint, no_bicubic=True)
+                else:
+                    print(f'[SR-NeRF] 对 {split_dir} 进行 2x 超分辨率（800→1600）...')
+                    run_sr(input_dir=split_dir, output_dir=sr_dir,
+                           checkpoint=args.sr_checkpoint, no_bicubic=True)
+                print(f'[SR-NeRF] {split} SR 完成，结果在: {sr_dir}')
 
     # 数据加载
     K = None
@@ -758,6 +799,13 @@ def train():
             rgbs, _ = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test, gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
             print('Done rendering', testsavedir)
             imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
+            # Super-NeRF 评价指标（LPIPS + NIQE）
+            evaluate_nerf_metrics(
+                rgbs,
+                gt_imgs=images,
+                device=device,
+                save_path=os.path.join(testsavedir, 'metrics.txt')
+            )
 
             return
 
@@ -789,6 +837,10 @@ def train():
 
 
     N_iters = 200000 + 1
+    # AMP 混合精度：FP16 前向 + FP32 梯度，~1.5-2× 加速，显存占用减半
+    use_amp = (device.type == 'cuda')
+    scaler  = torch.cuda.amp.GradScaler(enabled=use_amp)
+    print(f'[Config] AMP mixed precision: {use_amp}')
     print('Begin')
     print('TRAIN views are', i_train)
     print('TEST views are', i_test)
@@ -848,26 +900,28 @@ def train():
                 batch_rays = torch.stack([rays_o, rays_d], 0)
                 target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
 
-        # 渲染和计算损失
-        rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
-                                                verbose=i < 10, retraw=True,
-                                                **render_kwargs_train)
+        # 渲染和计算损失（AMP autocast：FP16 前向加速）
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
+                                                    verbose=i < 10, retraw=True,
+                                                    **render_kwargs_train)
 
+            img_loss = img2mse(rgb, target_s)
+            trans = extras['raw'][...,-1]
+            loss = img_loss
+            psnr = mse2psnr(img_loss)
+
+            # 两阶段损失
+            if 'rgb0' in extras:
+                img_loss0 = img2mse(extras['rgb0'], target_s)
+                loss = loss + img_loss0
+                psnr0 = mse2psnr(img_loss0)
+
+        #  反向传播和优化（AMP scaler 防止 FP16 梯度下溢）
         optimizer.zero_grad()
-        img_loss = img2mse(rgb, target_s)
-        trans = extras['raw'][...,-1]
-        loss = img_loss
-        psnr = mse2psnr(img_loss)
-
-        # 两阶段损失
-        if 'rgb0' in extras:
-            img_loss0 = img2mse(extras['rgb0'], target_s)
-            loss = loss + img_loss0
-            psnr0 = mse2psnr(img_loss0)
-
-        #  反向传播和优化
-        loss.backward()
-        optimizer.step()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         # NOTE: IMPORTANT!
         # 学习率衰减
@@ -916,8 +970,17 @@ def train():
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', poses[i_test].shape)
             with torch.no_grad():
-                render_path(torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
+                rgbs_test, _ = render_path(
+                    torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk,
+                    render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
             print('Saved test set')
+            # Super-NeRF 评价指标（LPIPS 感知一致性 + NIQE 无参考图像质量）
+            evaluate_nerf_metrics(
+                rgbs_test,
+                gt_imgs=images[i_test],
+                device=device,
+                save_path=os.path.join(testsavedir, 'metrics.txt')
+            )
 
 
         # 打印训练信息

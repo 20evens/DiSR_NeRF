@@ -501,15 +501,22 @@ function Dashboard({ username, onLogout }) {
             <div ref={logRef} className="flex-1 overflow-y-auto p-4 log-terminal log-scroll">
               {logs.length===0
                 ? <p className="text-xs" style={{color:'#6b7280'}}>等待运行…</p>
-                : logs.map((line,i)=>(
-                  <div key={i} className="whitespace-pre-wrap break-all text-xs leading-relaxed"
-                    style={{color: line.startsWith('[错误]')||line.startsWith('[异常]')||line.startsWith('[OOM]') ? '#f87171'
-                              : line.startsWith('[完成]') ? '#4ade80'
-                              : line.startsWith('[启动]')||line.startsWith('[SR]') ? '#93c5fd'
-                              : '#d1d5db'}}>
-                    {line}
-                  </div>
-                ))
+                : logs.map((line,i)=>{
+                    // 检测 LPIPS/NIQE 指标行
+                    const isMetric = line.includes('LPIPS') || line.includes('NIQE') || line.includes('Super-NeRF');
+                    const color = line.startsWith('[错误]')||line.startsWith('[异常]')||line.startsWith('[OOM]') ? '#f87171'
+                                : line.startsWith('[完成]') ? '#4ade80'
+                                : line.startsWith('[启动]')||line.startsWith('[SR]') ? '#93c5fd'
+                                : line.startsWith('[Metrics]') || isMetric ? '#22d3ee'  // 青色高亮指标
+                                : '#d1d5db';
+                    const weight = isMetric || line.includes('===') ? 'bold' : 'normal';
+                    return (
+                      <div key={i} className="whitespace-pre-wrap break-all text-xs leading-relaxed"
+                        style={{color, fontWeight:weight}}>
+                        {line}
+                      </div>
+                    );
+                  })
               }
             </div>
           </div>

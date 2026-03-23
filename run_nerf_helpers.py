@@ -8,7 +8,7 @@ import numpy as np
 # Misc
 img2mse = lambda x, y : torch.mean((x - y) ** 2)
 mse2psnr = lambda x : -10. * torch.log(x) / torch.log(torch.Tensor([10.]))
-to8b = lambda x : (255*np.clip(x,0,1)).astype(np.uint8)
+to8b = lambda x : (255*np.clip(np.nan_to_num(x, nan=0.0, posinf=1.0, neginf=0.0),0,1)).astype(np.uint8)
 
 
 # Positional encoding (section 5.1)

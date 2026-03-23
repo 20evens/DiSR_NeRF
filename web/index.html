@@ -63,7 +63,8 @@ const api = {
   preview:    (path)  => req('GET', `/files/preview?path=${encodeURIComponent(path)}`),
   findVideo:  (path)  => req('GET', `/files/find_video?path=${encodeURIComponent(path)}`),
   parseConfig:(path)  => req('GET', `/config/parse?datadir=${encodeURIComponent(path)}`),
-  runProcess: (body)  => req('POST', '/process/run', body),
+  runProcess:    (body) => req('POST', '/process/run', body),
+  cancelProcess:  (id)   => req('POST', `/process/cancel/${id}`),
   streamLogs: (id)    => new EventSource(`${BASE}/process/logs/${id}?token=${encodeURIComponent(getToken())}`),
 };
 
@@ -286,11 +287,12 @@ function Dashboard({ username, onLogout }) {
   const [browserOpen,   setBrowserOpen]   = useState(false);
   const [browserTarget, setBrowserTarget] = useState('input');
 
-  const [status,    setStatus]   = useState('idle');
-  const [progress,  setProgress] = useState(0);
-  const [logs,      setLogs]     = useState([]);
-  const [videoPath, setVideo]    = useState(null);
-  const [jobErr,    setJobErr]   = useState('');
+  const [status,       setStatus]    = useState('idle');
+  const [progress,     setProgress]  = useState(0);
+  const [logs,         setLogs]      = useState([]);
+  const [videoPath,    setVideo]     = useState(null);
+  const [jobErr,       setJobErr]    = useState('');
+  const [currentJobId, setCurrentJobId] = useState(null);
 
   const logRef = useRef(null);
   const esRef  = useRef(null);
@@ -333,6 +335,7 @@ function Dashboard({ username, onLogout }) {
     try {
       const d = await api.runProcess({ mode, input_dir:inputDir, output_dir:outputDir,
         ddim_steps:ddimSteps, nerf_iters:nerfIters, sr_scale:srScale });
+      setCurrentJobId(d.job_id);
       startSSE(d.job_id);
     } catch(e) { setStatus('error'); setJobErr(e.message); setLogs([`[错误] ${e.message}`]); }
   }
@@ -357,9 +360,21 @@ function Dashboard({ username, onLogout }) {
     es.onerror = ()=>{ setStatus('error'); setLogs(p=>[...p,'[连接断开] SSE 连接已中断']); es.close(); };
   }
 
+  async function handleCancel() {
+    if (!currentJobId) return;
+    try {
+      await api.cancelProcess(currentJobId);
+    } catch(e) { /* ignore */ }
+    esRef.current?.close();
+    setStatus('error');
+    setLogs(p => [...p, '[取消] 已手动终止运行']);
+    setCurrentJobId(null);
+  }
+
   function handleRerun() {
     esRef.current?.close();
     setStatus('idle'); setProgress(0); setLogs([]); setVideo(null); setJobErr('');
+    setCurrentJobId(null);
   }
 
   const isRunning = status==='running';
@@ -498,11 +513,19 @@ function Dashboard({ username, onLogout }) {
             </div>
           )}
 
-          {/* Start */}
-          <button onClick={handleStart} disabled={isRunning}
-            className={`w-full py-3 rounded-xl font-semibold text-sm transition ${isRunning?'bg-gray-200 text-gray-400 cursor-not-allowed':'bg-indigo-600 hover:bg-indigo-700 text-white shadow-md'}`}>
-            {isRunning?'⏳ 运行中…':'▶ 开始运行'}
-          </button>
+          {/* Start / Cancel */}
+          <div className="flex gap-2">
+            <button onClick={handleStart} disabled={isRunning}
+              className={`flex-1 py-3 rounded-xl font-semibold text-sm transition ${isRunning?'bg-gray-200 text-gray-400 cursor-not-allowed':'bg-indigo-600 hover:bg-indigo-700 text-white shadow-md'}`}>
+              {isRunning?'⏳ 运行中…':'▶ 开始运行'}
+            </button>
+            {isRunning && (
+              <button onClick={handleCancel}
+                className="px-4 py-3 rounded-xl font-semibold text-sm bg-red-500 hover:bg-red-600 text-white shadow-md transition">
+                ⏹ 取消
+              </button>
+            )}
+          </div>
         </aside>
 
         {/* RIGHT 65% */}
@@ -564,7 +587,8 @@ function Dashboard({ username, onLogout }) {
                 <span className="text-xs text-gray-400 font-mono truncate max-w-xs">{videoPath}</span>
               </div>
               <video controls autoPlay loop className="w-full rounded-lg bg-black" style={{maxHeight:'260px'}}
-                src={`${BASE}/files/video?path=${encodeURIComponent(videoPath)}`}>
+                src={`${BASE}/files/video?path=${encodeURIComponent(videoPath)}&token=${encodeURIComponent(getToken()||'')}`}>
+                <source src={`${BASE}/files/video?path=${encodeURIComponent(videoPath)}&token=${encodeURIComponent(getToken()||'')}`} type="video/mp4"/>
                 您的浏览器不支持 HTML5 视频
               </video>
             </div>

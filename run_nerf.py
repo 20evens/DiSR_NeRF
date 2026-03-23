@@ -1,5 +1,7 @@
 import os, sys
+
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ.setdefault("TORCH_HOME", r"C:\Users\PC\.cache\torch")
 
 import numpy as np
 import imageio
@@ -22,11 +24,12 @@ from load_LINEMOD import load_LINEMOD_data
 from nerf_metrics import evaluate_nerf_metrics
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-torch.backends.cudnn.benchmark = True   # 自动选择最快算法，NeRF网络结构固定，首次略慢后续加速
+torch.backends.cudnn.benchmark = True  # 自动选择最快算法，NeRF网络结构固定，首次略慢后续加速
 np.random.seed(0)
 DEBUG = False
 
-#python run_nerf.py --config configs/lego.txt
+
+# python run_nerf.py --config configs/lego.txt
 
 
 def _downsample_blender_split(src_dir, dst_dir, scale=2):
@@ -40,11 +43,11 @@ def _downsample_blender_split(src_dir, dst_dir, scale=2):
         print(f'  [警告] {src_dir} 中未找到 PNG 文件')
         return
     for fname in png_files:
-        img = imageio.imread(os.path.join(src_dir, fname))   # RGBA uint8
+        img = imageio.imread(os.path.join(src_dir, fname))  # RGBA uint8
         H, W = img.shape[:2]
         new_W, new_H = W // scale, H // scale
         pil_img = _PILImage.fromarray(img)
-        pil_ds  = pil_img.resize((new_W, new_H), _PILImage.LANCZOS)
+        pil_ds = pil_img.resize((new_W, new_H), _PILImage.LANCZOS)
         imageio.imwrite(os.path.join(dst_dir, fname), np.array(pil_ds))
     print(f'  → {len(png_files)} 张图像下采样 {scale}× 至 {new_W}×{new_H}，保存在: {dst_dir}')
 
@@ -53,18 +56,20 @@ def batchify(fn, chunk):
     # 构建一个适用于较小批量处理的“fn”版本
     if chunk is None:
         return fn
+
     def ret(inputs):
-        return torch.cat([fn(inputs[i:i+chunk]) for i in range(0, inputs.shape[0], chunk)], 0)
+        return torch.cat([fn(inputs[i:i + chunk]) for i in range(0, inputs.shape[0], chunk)], 0)
+
     return ret
 
 
-def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
+def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024 * 64):
     # 准备输入数据，并应用网络“fn”。
     inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
     embedded = embed_fn(inputs_flat)
 
     if viewdirs is not None:
-        input_dirs = viewdirs[:,None].expand(inputs.shape)
+        input_dirs = viewdirs[:, None].expand(inputs.shape)
         input_dirs_flat = torch.reshape(input_dirs, [-1, input_dirs.shape[-1]])
         embedded_dirs = embeddirs_fn(input_dirs_flat)
         embedded = torch.cat([embedded, embedded_dirs], -1)
@@ -74,24 +79,24 @@ def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     return outputs
 
 
-def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
+def batchify_rays(rays_flat, chunk=1024 * 32, **kwargs):
     # 将光线渲染成更小的批次，以避免内存溢出。
     all_ret = {}
     for i in range(0, rays_flat.shape[0], chunk):
-        ret = render_rays(rays_flat[i:i+chunk], **kwargs)
+        ret = render_rays(rays_flat[i:i + chunk], **kwargs)
         for k in ret:
             if k not in all_ret:
                 all_ret[k] = []
             all_ret[k].append(ret[k])
 
-    all_ret = {k : torch.cat(all_ret[k], 0) for k in all_ret}
+    all_ret = {k: torch.cat(all_ret[k], 0) for k in all_ret}
     return all_ret
 
 
-def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
-                  near=0., far=1.,
-                  use_viewdirs=False, c2w_staticcam=None,
-                  **kwargs):
+def render(H, W, K, chunk=1024 * 32, rays=None, c2w=None, ndc=True,
+           near=0., far=1.,
+           use_viewdirs=False, c2w_staticcam=None,
+           **kwargs):
     """
     渲染光线
     Render rays
@@ -126,21 +131,21 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
         if c2w_staticcam is not None:
             # 特殊案例：使用静态相机变换
             rays_o, rays_d = get_rays(H, W, K, c2w_staticcam)
-        viewdirs = viewdirs / torch.norm(viewdirs, dim=-1, keepdim=True) # 归一化
-        viewdirs = torch.reshape(viewdirs, [-1,3]).float() # 创建
+        viewdirs = viewdirs / torch.norm(viewdirs, dim=-1, keepdim=True)  # 归一化
+        viewdirs = torch.reshape(viewdirs, [-1, 3]).float()  # 创建
 
-    sh = rays_d.shape # [..., 3]
+    sh = rays_d.shape  # [..., 3]
     if ndc:
         # 对于前向场景
         # 将光线转换到NDC空间（适用于前向场景）
         rays_o, rays_d = ndc_rays(H, W, K[0][0], 1., rays_o, rays_d)
 
     # 创建光线数据
-    rays_o = torch.reshape(rays_o, [-1,3]).float()
-    rays_d = torch.reshape(rays_d, [-1,3]).float()
+    rays_o = torch.reshape(rays_o, [-1, 3]).float()
+    rays_d = torch.reshape(rays_d, [-1, 3]).float()
 
     # # 设置近远平面
-    near, far = near * torch.ones_like(rays_d[...,:1]), far * torch.ones_like(rays_d[...,:1])
+    near, far = near * torch.ones_like(rays_d[..., :1]), far * torch.ones_like(rays_d[..., :1])
     # 拼接光线数据：[原点(3), 方向(3), 近(1), 远(1)]
     rays = torch.cat([rays_o, rays_d, near, far], -1)
     # 如果使用视角方向，添加到光线数据中
@@ -158,12 +163,11 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
     k_extract = ['rgb_map', 'disp_map', 'acc_map']
     ret_list = [all_ret[k] for k in k_extract]
     # 其他额外结果
-    ret_dict = {k : all_ret[k] for k in all_ret if k not in k_extract}
+    ret_dict = {k: all_ret[k] for k in all_ret if k not in k_extract}
     return ret_list + [ret_dict]
 
 
 def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedir=None, render_factor=0):
-
     """
     定义一个用于渲染相机轨迹路径的函数
     render_poses: 相机位姿列表，每个位姿定义了一个相机的位置和方向
@@ -178,11 +182,11 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
 
     H, W, focal = hwf
 
-    if render_factor!=0:
+    if render_factor != 0:
         # 调整分辨率
-        H = H//render_factor
-        W = W//render_factor
-        focal = focal/render_factor
+        H = H // render_factor
+        W = W // render_factor
+        focal = focal / render_factor
 
     rgbs = []
     disps = []
@@ -192,10 +196,10 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
     for i, c2w in enumerate(tqdm(render_poses)):
         print(i, time.time() - t)
         t = time.time()
-        rgb, disp, acc, _ = render(H, W, K, chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)
+        rgb, disp, acc, _ = render(H, W, K, chunk=chunk, c2w=c2w[:3, :4], **render_kwargs)
         rgbs.append(rgb.cpu().numpy())
         disps.append(disp.cpu().numpy())
-        if i==0:
+        if i == 0:
             print(rgb.shape, disp.shape)
 
         """
@@ -204,12 +208,11 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
             print(p)
         """
 
-    # 保存结果
+        # 保存结果
         if savedir is not None:
             rgb8 = to8b(rgbs[-1])
             filename = os.path.join(savedir, '{:03d}.png'.format(i))
             imageio.imwrite(filename, rgb8)
-
 
     rgbs = np.stack(rgbs, 0)
     disps = np.stack(disps, 0)
@@ -245,10 +248,10 @@ def create_nerf(args):
         grad_vars += list(model_fine.parameters())
 
     # 网络查询函数
-    network_query_fn = lambda inputs, viewdirs, network_fn : run_network(inputs, viewdirs, network_fn,
-                                                                embed_fn=embed_fn,
-                                                                embeddirs_fn=embeddirs_fn,
-                                                                netchunk=args.netchunk)
+    network_query_fn = lambda inputs, viewdirs, network_fn: run_network(inputs, viewdirs, network_fn,
+                                                                        embed_fn=embed_fn,
+                                                                        embeddirs_fn=embeddirs_fn,
+                                                                        netchunk=args.netchunk)
 
     # 优化器
     optimizer = torch.optim.Adam(params=grad_vars, lr=args.lrate, betas=(0.9, 0.999))
@@ -257,12 +260,12 @@ def create_nerf(args):
     basedir = args.basedir
     expname = args.expname
 
-
     # 检查点加载
-    if args.ft_path is not None and args.ft_path!='None':
+    if args.ft_path is not None and args.ft_path != 'None':
         ckpts = [args.ft_path]
     else:
-        ckpts = [os.path.join(basedir, expname, f) for f in sorted(os.listdir(os.path.join(basedir, expname))) if 'tar' in f]
+        ckpts = [os.path.join(basedir, expname, f) for f in sorted(os.listdir(os.path.join(basedir, expname))) if
+                 'tar' in f]
 
     print('Found ckpts', ckpts)
     if len(ckpts) > 0 and not args.no_reload:
@@ -278,18 +281,17 @@ def create_nerf(args):
         if model_fine is not None:
             model_fine.load_state_dict(ckpt['network_fine_state_dict'])
 
-
     # 渲染参数配置
     render_kwargs_train = {
-        'network_query_fn' : network_query_fn,
-        'perturb' : args.perturb,
-        'N_importance' : args.N_importance,
-        'network_fine' : model_fine,
-        'N_samples' : args.N_samples,
-        'network_fn' : model,
-        'use_viewdirs' : args.use_viewdirs,
-        'white_bkgd' : args.white_bkgd,
-        'raw_noise_std' : args.raw_noise_std,
+        'network_query_fn': network_query_fn,
+        'perturb': args.perturb,
+        'N_importance': args.N_importance,
+        'network_fine': model_fine,
+        'N_samples': args.N_samples,
+        'network_fn': model,
+        'use_viewdirs': args.use_viewdirs,
+        'white_bkgd': args.white_bkgd,
+        'raw_noise_std': args.raw_noise_std,
     }
 
     # NDC设置
@@ -299,7 +301,7 @@ def create_nerf(args):
         render_kwargs_train['ndc'] = False
         render_kwargs_train['lindisp'] = args.lindisp
 
-    render_kwargs_test = {k : render_kwargs_train[k] for k in render_kwargs_train}
+    render_kwargs_test = {k: render_kwargs_train[k] for k in render_kwargs_train}
     render_kwargs_test['perturb'] = False
     render_kwargs_test['raw_noise_std'] = 0.
 
@@ -321,47 +323,47 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     """
     # AMP 安全：体积渲染（exp/cumprod/1e-10 epsilon）需要 FP32 精度
     # MLP 前向已在 FP16 加速，此处转回 FP32 保证数值稳定
-    raw    = raw.float()
+    raw = raw.float()
     z_vals = z_vals.float()
     rays_d = rays_d.float()
 
-    raw2alpha = lambda raw, dists, act_fn=F.relu: 1.-torch.exp(-act_fn(raw)*dists)
+    raw2alpha = lambda raw, dists, act_fn=F.relu: 1. - torch.exp(-act_fn(raw) * dists)
 
     # 计算采样点之间的距离
-    dists = z_vals[...,1:] - z_vals[...,:-1]
-    dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[...,:1].shape)], -1)  # [N_rays, N_samples]
+    dists = z_vals[..., 1:] - z_vals[..., :-1]
+    dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[..., :1].shape)], -1)  # [N_rays, N_samples]
 
     # 校正距离（考虑射线方向）
-    dists = dists * torch.norm(rays_d[...,None,:], dim=-1)
+    dists = dists * torch.norm(rays_d[..., None, :], dim=-1)
 
     #  处理颜色和密度
-    rgb = torch.sigmoid(raw[...,:3])  # [N_rays, N_samples, 3]  # 将logits转换为[0,1]范围
+    rgb = torch.sigmoid(raw[..., :3])  # [N_rays, N_samples, 3]  # 将logits转换为[0,1]范围
     noise = 0.
     if raw_noise_std > 0.:
-        noise = torch.randn(raw[...,3].shape) * raw_noise_std
+        noise = torch.randn(raw[..., 3].shape) * raw_noise_std
 
         # 如果进行pytest，则覆盖随机采样的数据
         if pytest:
             np.random.seed(0)
-            noise = np.random.rand(*list(raw[...,3].shape)) * raw_noise_std
+            noise = np.random.rand(*list(raw[..., 3].shape)) * raw_noise_std
             noise = torch.Tensor(noise)
 
     # 计算透明度（alpha）
-    alpha = raw2alpha(raw[...,3] + noise, dists)  # [N_rays, N_samples]
+    alpha = raw2alpha(raw[..., 3] + noise, dists)  # [N_rays, N_samples]
     #  计算累积权重
     # weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, -1, exclusive=True)
-    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1]
+    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1. - alpha + 1e-10], -1), -1)[:, :-1]
     # 计算最终渲染结果
-    rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3] # 加权求和得到颜色
+    rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [N_rays, 3] # 加权求和得到颜色
 
-    depth_map = torch.sum(weights * z_vals, -1) # 加权平均得到深度
-    depth_sum = torch.sum(weights, -1).clamp(min=1e-10)   # 防止背景光线 0/0 → NaN
-    disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map / depth_sum)
-    acc_map = torch.sum(weights, -1) # 累积权重（总不透明度）
+    depth_map = torch.sum(weights * z_vals, -1)  # 加权平均得到深度
+    depth_sum = torch.sum(weights, -1).clamp(min=1e-10)  # 防止背景光线 0/0 → NaN
+    disp_map = 1. / torch.max(1e-10 * torch.ones_like(depth_map), depth_map / depth_sum)
+    acc_map = torch.sum(weights, -1)  # 累积权重（总不透明度）
 
     # 处理白色背景
     if white_bkgd:
-        rgb_map = rgb_map + (1.-acc_map[...,None])
+        rgb_map = rgb_map + (1. - acc_map[..., None])
 
     return rgb_map, disp_map, acc_map, weights, depth_map
 
@@ -407,28 +409,28 @@ def render_rays(ray_batch,
     """
     # 解析光线批次
     N_rays = ray_batch.shape[0]
-    rays_o, rays_d = ray_batch[:,0:3], ray_batch[:,3:6] # [N_rays, 3] each # 光线起点和方向
-    viewdirs = ray_batch[:,-3:] if ray_batch.shape[-1] > 8 else None # 视角方向
-    bounds = torch.reshape(ray_batch[...,6:8], [-1,1,2]) # 近远边界
-    near, far = bounds[...,0], bounds[...,1] # [-1,1]  # 近平面和远平面
+    rays_o, rays_d = ray_batch[:, 0:3], ray_batch[:, 3:6]  # [N_rays, 3] each # 光线起点和方向
+    viewdirs = ray_batch[:, -3:] if ray_batch.shape[-1] > 8 else None  # 视角方向
+    bounds = torch.reshape(ray_batch[..., 6:8], [-1, 1, 2])  # 近远边界
+    near, far = bounds[..., 0], bounds[..., 1]  # [-1,1]  # 近平面和远平面
 
     # 沿光线采样
-    t_vals = torch.linspace(0., 1., steps=N_samples) # 在[0,1]区间均匀采样
+    t_vals = torch.linspace(0., 1., steps=N_samples)  # 在[0,1]区间均匀采样
     if not lindisp:
-        z_vals = near * (1.-t_vals) + far * (t_vals)  # 线性深度采样
+        z_vals = near * (1. - t_vals) + far * (t_vals)  # 线性深度采样
     else:
-        z_vals = 1./(1./near * (1.-t_vals) + 1./far * (t_vals)) # 线性视差采样
+        z_vals = 1. / (1. / near * (1. - t_vals) + 1. / far * (t_vals))  # 线性视差采样
 
     z_vals = z_vals.expand([N_rays, N_samples])
 
     # 采样点扰动
     if perturb > 0.:
         # 获取样本之间的间隔
-        mids = .5 * (z_vals[...,1:] + z_vals[...,:-1]) # 计算区间中点
-        upper = torch.cat([mids, z_vals[...,-1:]], -1) # 上边界
-        lower = torch.cat([z_vals[...,:1], mids], -1) # 下边界
+        mids = .5 * (z_vals[..., 1:] + z_vals[..., :-1])  # 计算区间中点
+        upper = torch.cat([mids, z_vals[..., -1:]], -1)  # 上边界
+        lower = torch.cat([z_vals[..., :1], mids], -1)  # 下边界
         # 区间内的分层样本
-        t_rand = torch.rand(z_vals.shape) # 随机数
+        t_rand = torch.rand(z_vals.shape)  # 随机数
 
         # 在Pytest中，使用numpy的固定随机数覆盖
         if pytest:
@@ -436,48 +438,49 @@ def render_rays(ray_batch,
             t_rand = np.random.rand(*list(z_vals.shape))
             t_rand = torch.Tensor(t_rand)
 
-        z_vals = lower + (upper - lower) * t_rand # 在区间内随机采样
+        z_vals = lower + (upper - lower) * t_rand  # 在区间内随机采样
 
     # 计算3D采样点坐标
-    pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
+    pts = rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., :, None]  # [N_rays, N_samples, 3]
 
-
-#     raw = run_network(pts)
+    #     raw = run_network(pts)
     # 粗渲染（第一阶段）
-    raw = network_query_fn(pts, viewdirs, network_fn) # 查询粗网络
-    rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
+    raw = network_query_fn(pts, viewdirs, network_fn)  # 查询粗网络
+    rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd,
+                                                                 pytest=pytest)
 
     # 细渲染（第二阶段，重要性采样）
     if N_importance > 0:
-
-        rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map   # 保存粗渲染结果
+        rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map  # 保存粗渲染结果
 
         # 计算中点用于概率密度函数
-        z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1])
+        z_vals_mid = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
         # 基于权重进行重要性采样
-        z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.), pytest=pytest)
+        z_samples = sample_pdf(z_vals_mid, weights[..., 1:-1], N_importance, det=(perturb == 0.), pytest=pytest)
         z_samples = z_samples.detach()
         # 合并粗采样点和细采样点
         z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
         # 重新计算采样点坐标
-        pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples + N_importance, 3]
+        pts = rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., :,
+                                                            None]  # [N_rays, N_samples + N_importance, 3]
 
         # 使用细网络查询（如果提供了细网络）
         run_fn = network_fn if network_fine is None else network_fine
-#         raw = run_network(pts, fn=run_fn)
+        #         raw = run_network(pts, fn=run_fn)
         raw = network_query_fn(pts, viewdirs, run_fn)
 
         # 细渲染
-        rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
+        rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd,
+                                                                     pytest=pytest)
 
     # 构建返回字典
-    ret = {'rgb_map' : rgb_map, 'disp_map' : disp_map, 'acc_map' : acc_map}
+    ret = {'rgb_map': rgb_map, 'disp_map': disp_map, 'acc_map': acc_map}
     if retraw:
-        ret['raw'] = raw    # 原始预测值
+        ret['raw'] = raw  # 原始预测值
     if N_importance > 0:
-        ret['rgb0'] = rgb_map_0     # 粗渲染颜色
-        ret['disp0'] = disp_map_0   # 粗渲染视差
-        ret['acc0'] = acc_map_0     # 粗渲染累积不透明度
+        ret['rgb0'] = rgb_map_0  # 粗渲染颜色
+        ret['disp0'] = disp_map_0  # 粗渲染视差
+        ret['acc0'] = acc_map_0  # 粗渲染累积不透明度
         ret['z_std'] = torch.std(z_samples, dim=-1, unbiased=False)  # [N_rays] # 采样深度标准差
 
     for k in ret:
@@ -485,6 +488,7 @@ def render_rays(ray_batch,
             print(f"! [Numerical Error] {k} contains nan or inf.")
 
     return ret
+
 
 def config_parser():
     # 项目的配置解析函数，使用configargparse库来定义和解析命令行参数以及配置文件。
@@ -500,7 +504,7 @@ def config_parser():
     parser.add_argument("--datadir", type=str, default='./data/nerf_llff_data/fern',
                         help='input data directory')
 
-    #parser.add_argument("--datadir", type=str, default='./data/llff/fern',
+    # parser.add_argument("--datadir", type=str, default='./data/llff/fern',
     #                    help='input data directory')
 
     # 训练选项
@@ -512,16 +516,16 @@ def config_parser():
                         help='layers in fine network')
     parser.add_argument("--netwidth_fine", type=int, default=256,
                         help='channels per layer in fine network')
-    parser.add_argument("--N_rand", type=int, default=32*32*4,
+    parser.add_argument("--N_rand", type=int, default=32 * 32 * 4,
                         help='batch size (number of random rays per gradient step)')
     parser.add_argument("--lrate", type=float, default=5e-4,
                         help='learning rate')
     parser.add_argument("--lrate_decay", type=int, default=250,
                         help='exponential learning rate decay (in 1000 steps)')
     # 内存优化选项
-    parser.add_argument("--chunk", type=int, default=1024*64,
+    parser.add_argument("--chunk", type=int, default=1024 * 64,
                         help='number of rays processed in parallel, decrease if running out of memory')
-    parser.add_argument("--netchunk", type=int, default=1024*256,
+    parser.add_argument("--netchunk", type=int, default=1024 * 256,
                         help='number of pts sent through network in parallel, decrease if running out of memory')
 
     parser.add_argument("--no_batching", action='store_true',
@@ -599,37 +603,41 @@ def config_parser():
     parser.add_argument("--sr_checkpoint", type=str, default=None,
                         help='扩散模型检查点路径，默认 ./checkpoints/best_model.pth')
 
+    # 训练迭代次数
+    parser.add_argument("--N_iters", type=int, default=200000,
+                        help='total number of training iterations')
+
     # 日志和保存选项
-    parser.add_argument("--i_print",   type=int, default=100,
+    parser.add_argument("--i_print", type=int, default=100,
                         help='frequency of console printout and metric loggin')
-    parser.add_argument("--i_img",     type=int, default=500,
+    parser.add_argument("--i_img", type=int, default=500,
                         help='frequency of tensorboard image logging')
     parser.add_argument("--i_weights", type=int, default=10000,
                         help='frequency of weight ckpt saving')
     parser.add_argument("--i_testset", type=int, default=50000,
                         help='frequency of testset saving')
-    parser.add_argument("--i_video",   type=int, default=50000,
+    parser.add_argument("--i_video", type=int, default=50000,
                         help='frequency of render_poses video saving')
 
     return parser
 
+
 # NeRF训练的主函数，包含了数据加载、模型创建、训练循环、渲染和日志记录等完整流程。
 def train():
-
     # 参数解析
     parser = config_parser()
     args = parser.parse_args()
 
     # 超分辨率预处理（同时支持 llff 和 blender 数据集）
-    sr_imgdir        = None   # LLFF 用
-    sr_blender_basedir = None   # Blender 用
+    sr_imgdir = None  # LLFF 用
+    sr_blender_basedir = None  # Blender 用
 
     if args.sr_preprocess:
         from test_full import run_sr
 
         if args.dataset_type == 'llff':
-            sr_imgdir  = os.path.join(args.datadir, 'images_sr')
-            lr_imgdir  = os.path.join(args.datadir, 'images_{}'.format(args.factor))
+            sr_imgdir = os.path.join(args.datadir, 'images_sr')
+            lr_imgdir = os.path.join(args.datadir, 'images_{}'.format(args.factor))
             if os.path.exists(sr_imgdir) and len(os.listdir(sr_imgdir)) > 0:
                 print(f'[SR-NeRF] SR图像已存在: {sr_imgdir}，跳过')
             else:
@@ -642,7 +650,7 @@ def train():
             sr_blender_basedir = args.datadir
             for split in ['train', 'val', 'test']:
                 split_dir = os.path.join(args.datadir, split)
-                sr_dir    = os.path.join(args.datadir, split + '_sr')
+                sr_dir = os.path.join(args.datadir, split + '_sr')
                 if not os.path.isdir(split_dir):
                     continue
                 if os.path.isdir(sr_dir) and len(os.listdir(sr_dir)) > 0:
@@ -671,8 +679,8 @@ def train():
                                                                   recenter=True, bd_factor=.75,
                                                                   spherify=args.spherify,
                                                                   sr_imgdir=sr_imgdir)
-        hwf = poses[0,:3,-1]
-        poses = poses[:,:3,:4]
+        hwf = poses[0, :3, -1]
+        poses = poses[:, :3, :4]
         print('Loaded llff', images.shape, render_poses.shape, hwf, args.datadir)
         if not isinstance(i_test, list):
             i_test = [i_test]
@@ -683,7 +691,7 @@ def train():
 
         i_val = i_test
         i_train = np.array([i for i in np.arange(int(images.shape[0])) if
-                        (i not in i_test and i not in i_val)])
+                            (i not in i_test and i not in i_val)])
 
         print('DEFINING BOUNDS')
         if args.no_ndc:
@@ -698,28 +706,37 @@ def train():
     elif args.dataset_type == 'blender':
         images, poses, render_poses, hwf, i_split = load_blender_data(
             args.datadir, args.half_res, args.testskip,
-            sr_basedir=sr_blender_basedir)
+
+            # 迁就低GPU
+            # sr_basedir=sr_blender_basedir) -高
+
+            sr_basedir=sr_blender_basedir, white_bkgd=args.white_bkgd)
         print('Loaded blender', images.shape, render_poses.shape, hwf, args.datadir)
         i_train, i_val, i_test = i_split
 
         near = 2.
         far = 6.
 
-        if args.white_bkgd:
-            images = images[...,:3]*images[...,-1:] + (1.-images[...,-1:])
-        else:
-            images = images[...,:3]
+        # 迁就低GPU
+
+        # if args.white_bkgd: -高
+            # images = images[..., :3] * images[..., -1:] + (1. - images[..., -1:])
+        # else:
+            # images = images[..., :3]
+
+        # alpha 合成已在 load_blender_data 内逐帧完成，此处无需重复操作
 
     elif args.dataset_type == 'LINEMOD':
-        images, poses, render_poses, hwf, K, i_split, near, far = load_LINEMOD_data(args.datadir, args.half_res, args.testskip)
+        images, poses, render_poses, hwf, K, i_split, near, far = load_LINEMOD_data(args.datadir, args.half_res,
+                                                                                    args.testskip)
         print(f'Loaded LINEMOD, images shape: {images.shape}, hwf: {hwf}, K: {K}')
         print(f'[CHECK HERE] near: {near}, far: {far}.')
         i_train, i_val, i_test = i_split
 
         if args.white_bkgd:
-            images = images[...,:3]*images[...,-1:] + (1.-images[...,-1:])
+            images = images[..., :3] * images[..., -1:] + (1. - images[..., -1:])
         else:
-            images = images[...,:3]
+            images = images[..., :3]
 
     elif args.dataset_type == 'deepvoxels':
 
@@ -730,9 +747,9 @@ def train():
         print('Loaded deepvoxels', images.shape, render_poses.shape, hwf, args.datadir)
         i_train, i_val, i_test = i_split
 
-        hemi_R = np.mean(np.linalg.norm(poses[:,:3,-1], axis=-1))
-        near = hemi_R-1.
-        far = hemi_R+1.
+        hemi_R = np.mean(np.linalg.norm(poses[:, :3, -1], axis=-1))
+        near = hemi_R - 1.
+        far = hemi_R + 1.
 
     else:
         print('Unknown dataset type', args.dataset_type, 'exiting')
@@ -745,8 +762,8 @@ def train():
 
     if K is None:
         K = np.array([
-            [focal, 0, 0.5*W],
-            [0, focal, 0.5*H],
+            [focal, 0, 0.5 * W],
+            [0, focal, 0.5 * H],
             [0, 0, 1]
         ])
 
@@ -756,11 +773,11 @@ def train():
     # 创建实验目录和保存配置
     basedir = args.basedir
     expname = args.expname
-    
+
     # half_res 时自动添加 _half 后缀区分输出路径
     if args.half_res and not expname.endswith('_half'):
         expname = expname + '_half'
-    
+
     os.makedirs(os.path.join(basedir, expname), exist_ok=True)
     f = os.path.join(basedir, expname, 'args.txt')
     with open(f, 'w') as file:
@@ -778,18 +795,18 @@ def train():
 
     # 训练已完成时自动切换为 render_only 模式
     # 注意：checkpoint 保存的是当前步数，训练循环会从 start+1 开始
-    N_iters_target = 200000
+    N_iters_target = args.N_iters
     if start + 1 >= N_iters_target and not args.render_only:
-        print(f'\n{"="*60}')
-        print(f'[训练完成] 检查点步数 {start}，下一步将是 {start+1} >= 目标步数 {N_iters_target}')
+        print(f'\n{"=" * 60}')
+        print(f'[训练完成] 检查点步数 {start}，下一步将是 {start + 1} >= 目标步数 {N_iters_target}')
         print(f'[训练完成] 自动切换为 render_only + render_test 模式')
-        print(f'{"="*60}\n')
+        print(f'{"=" * 60}\n')
         args.render_only = True
         args.render_test = True
 
     bds_dict = {
-        'near' : near,
-        'far' : far,
+        'near': near,
+        'far': far,
     }
     render_kwargs_train.update(bds_dict)
     render_kwargs_test.update(bds_dict)
@@ -823,11 +840,11 @@ def train():
         existing_pngs = sorted([f for f in os.listdir(testsavedir) if f.endswith('.png')])
         n_target = len(render_poses) if images is None else len(images)
 
-        print(f'\n{"="*60}')
+        print(f'\n{"=" * 60}')
         print(f'[渲染检测] 输出目录: {testsavedir}')
         print(f'[渲染检测] 目标视角数: {n_target}')
         print(f'[渲染检测] 已有PNG文件: {len(existing_pngs)}')
-        print(f'{"="*60}\n')
+        print(f'{"=" * 60}\n')
 
         if len(existing_pngs) >= n_target:
             # 已有渲染结果，跳过渲染，直接加载
@@ -838,10 +855,11 @@ def train():
                 for f in existing_pngs[:n_target]
             ], 0)
             print(f'[跳过渲染] 成功加载 {len(rgbs)} 张图像')
-            
+
             if not os.path.exists(video_path):
                 print(f'[视频生成] 从已有图像生成视频...')
-                imageio.mimwrite(video_path, to8b(rgbs), fps=30, quality=8)
+                imageio.mimwrite(video_path, to8b(rgbs), fps=30, quality=8,
+                                 codec='libx264', pixelformat='yuv420p')
                 print(f'[视频生成] 已保存: {video_path}')
             else:
                 print(f'[视频生成] 视频已存在，跳过: {video_path}')
@@ -850,10 +868,12 @@ def train():
             print(f'[开始渲染] 图像不足 ({len(existing_pngs)}/{n_target})，开始渲染...')
             print(f'[开始渲染] 测试位姿形状: {render_poses.shape}')
             with torch.no_grad():
-                rgbs, _ = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test, gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
+                rgbs, _ = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test, gt_imgs=images,
+                                      savedir=testsavedir, render_factor=args.render_factor)
             print(f'[渲染完成] 已保存 {len(rgbs)} 张图像至: {testsavedir}')
             print(f'[视频生成] 生成视频中...')
-            imageio.mimwrite(video_path, to8b(rgbs), fps=30, quality=8)
+            imageio.mimwrite(video_path, to8b(rgbs), fps=30, quality=8,
+                             codec='libx264', pixelformat='yuv420p')
             print(f'[视频生成] 已保存: {video_path}')
 
         # Super-NeRF 评价指标（LPIPS + NIQE）
@@ -891,12 +911,12 @@ def train():
     if use_batching:
         # 准备光线批处理
         print('get rays')
-        rays = np.stack([get_rays_np(H, W, K, p) for p in poses[:,:3,:4]], 0) # [N, ro+rd, H, W, 3]
+        rays = np.stack([get_rays_np(H, W, K, p) for p in poses[:, :3, :4]], 0)  # [N, ro+rd, H, W, 3]
         print('done, concats')
-        rays_rgb = np.concatenate([rays, images[:,None]], 1) # [N, ro+rd+rgb, H, W, 3]
-        rays_rgb = np.transpose(rays_rgb, [0,2,3,1,4]) # [N, H, W, ro+rd+rgb, 3]
-        rays_rgb = np.stack([rays_rgb[i] for i in i_train], 0) # train images only
-        rays_rgb = np.reshape(rays_rgb, [-1,3,3]) # [(N-1)*H*W, ro+rd+rgb, 3]
+        rays_rgb = np.concatenate([rays, images[:, None]], 1)  # [N, ro+rd+rgb, H, W, 3]
+        rays_rgb = np.transpose(rays_rgb, [0, 2, 3, 1, 4])  # [N, H, W, ro+rd+rgb, 3]
+        rays_rgb = np.stack([rays_rgb[i] for i in i_train], 0)  # train images only
+        rays_rgb = np.reshape(rays_rgb, [-1, 3, 3])  # [(N-1)*H*W, ro+rd+rgb, 3]
         rays_rgb = rays_rgb.astype(np.float32)
         print('shuffle rays')
         np.random.shuffle(rays_rgb)
@@ -911,11 +931,10 @@ def train():
     if use_batching:
         rays_rgb = torch.Tensor(rays_rgb).to(device)
 
-
-    N_iters = 200000 + 1
+    N_iters = args.N_iters + 1
     # AMP 混合精度：FP16 前向 + FP32 梯度，~1.5-2× 加速，显存占用减半
     use_amp = (device.type == 'cuda')
-    scaler  = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     print(f'[Config] AMP mixed precision: {use_amp}')
     print('Begin')
     print('TRAIN views are', i_train)
@@ -932,7 +951,7 @@ def train():
         # 使用预计算的光线批处理
         if use_batching:
             # 从所有随机采样
-            batch = rays_rgb[i_batch:i_batch+N_rand] # [B, 2+1, 3*?]
+            batch = rays_rgb[i_batch:i_batch + N_rand]  # [B, 2+1, 3*?]
             batch = torch.transpose(batch, 0, 1)
             batch_rays, target_s = batch[:2], batch[2]
 
@@ -948,27 +967,30 @@ def train():
             img_i = np.random.choice(i_train)
             target = images[img_i]
             target = torch.Tensor(target).to(device)
-            pose = poses[img_i, :3,:4]
+            pose = poses[img_i, :3, :4]
 
             if N_rand is not None:
                 rays_o, rays_d = get_rays(H, W, K, torch.Tensor(pose))  # (H, W, 3), (H, W, 3)
-                #中心裁剪（Precrop）技巧
+                # 中心裁剪（Precrop）技巧
                 if i < args.precrop_iters:
-                    dH = int(H//2 * args.precrop_frac)
-                    dW = int(W//2 * args.precrop_frac)
+                    dH = int(H // 2 * args.precrop_frac)
+                    dW = int(W // 2 * args.precrop_frac)
                     coords = torch.stack(
                         torch.meshgrid(
-                            torch.linspace(H//2 - dH, H//2 + dH - 1, 2*dH),
-                            torch.linspace(W//2 - dW, W//2 + dW - 1, 2*dW),
+                            torch.linspace(H // 2 - dH, H // 2 + dH - 1, 2 * dH),
+                            torch.linspace(W // 2 - dW, W // 2 + dW - 1, 2 * dW),
                             indexing='ij'
                         ), -1)
                     if i == start:
-                        print(f"[Config] Center cropping of size {2*dH} x {2*dW} is enabled until iter {args.precrop_iters}")
+                        print(
+                            f"[Config] Center cropping of size {2 * dH} x {2 * dW} is enabled until iter {args.precrop_iters}")
                 else:
                     # coords = torch.stack(torch.meshgrid(torch.linspace(0, H-1, H), torch.linspace(0, W-1, W)), -1)  # (H, W, 2)
-                    coords = torch.stack(torch.meshgrid(torch.linspace(0, H-1, H), torch.linspace(0, W-1, W), indexing='ij'), -1)  # (H, W, 2)
+                    coords = torch.stack(
+                        torch.meshgrid(torch.linspace(0, H - 1, H), torch.linspace(0, W - 1, W), indexing='ij'),
+                        -1)  # (H, W, 2)
 
-                coords = torch.reshape(coords, [-1,2])  # (H * W, 2)
+                coords = torch.reshape(coords, [-1, 2])  # (H * W, 2)
                 select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
                 select_coords = coords[select_inds].long()  # (N_rand, 2)
                 rays_o = rays_o[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
@@ -979,11 +1001,11 @@ def train():
         # 渲染和计算损失（AMP autocast：FP16 前向加速）
         with torch.cuda.amp.autocast(enabled=use_amp):
             rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
-                                                    verbose=i < 10, retraw=True,
-                                                    **render_kwargs_train)
+                                            verbose=i < 10, retraw=True,
+                                            **render_kwargs_train)
 
             img_loss = img2mse(rgb, target_s)
-            trans = extras['raw'][...,-1]
+            trans = extras['raw'][..., -1]
             loss = img_loss
             psnr = mse2psnr(img_loss)
 
@@ -1008,12 +1030,12 @@ def train():
             param_group['lr'] = new_lrate
         ################################
 
-        dt = time.time()-time0
+        dt = time.time() - time0
         # print(f"Step: {global_step}, Loss: {loss}, Time: {dt}")
         #####           end            #####
 
         #  保存模型权重
-        if i%args.i_weights==0:
+        if i % args.i_weights == 0:
             path = os.path.join(basedir, expname, '{:06d}.tar'.format(i))
             torch.save({
                 'global_step': global_step,
@@ -1024,14 +1046,16 @@ def train():
             print('Saved checkpoints at', path)
 
         # 生成渲染视频
-        if i%args.i_video==0 and i > 0:
+        if i % args.i_video == 0 and i > 0:
             # Turn on testing mode
             with torch.no_grad():
                 rgbs, disps = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test)
             print('Done, saving', rgbs.shape, disps.shape)
             moviebase = os.path.join(basedir, expname, '{}_spiral_{:06d}_'.format(expname, i))
-            imageio.mimwrite(moviebase + 'rgb.mp4', to8b(rgbs), fps=30, quality=8)
-            imageio.mimwrite(moviebase + 'disp.mp4', to8b(disps / np.max(disps)), fps=30, quality=8)
+            imageio.mimwrite(moviebase + 'rgb.mp4', to8b(rgbs), fps=30, quality=8,
+                             codec='libx264', pixelformat='yuv420p')
+            imageio.mimwrite(moviebase + 'disp.mp4', to8b(disps / np.max(disps)), fps=30, quality=8,
+                             codec='libx264', pixelformat='yuv420p')
 
             # if args.use_viewdirs:
             #     render_kwargs_test['c2w_staticcam'] = render_poses[0][:3,:4]
@@ -1041,7 +1065,7 @@ def train():
             #     imageio.mimwrite(moviebase + 'rgb_still.mp4', to8b(rgbs_still), fps=30, quality=8)
 
         # 测试集评估
-        if i%args.i_testset==0 and i > 0:
+        if i % args.i_testset == 0 and i > 0:
             testsavedir = os.path.join(basedir, expname, 'testset_{:06d}'.format(i))
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', poses[i_test].shape)
@@ -1058,9 +1082,8 @@ def train():
                 save_path=os.path.join(testsavedir, 'metrics.txt')
             )
 
-
         # 打印训练信息
-        if i%args.i_print==0:
+        if i % args.i_print == 0:
             tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
         """
             print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
@@ -1107,7 +1130,7 @@ def train():
         global_step += 1
 
 
-if __name__=='__main__':
+if __name__ == '__main__':
     torch.set_default_tensor_type('torch.cuda.FloatTensor')
 
     train()

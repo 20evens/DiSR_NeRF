@@ -16,6 +16,7 @@ import jwt as pyjwt
 from pydantic import BaseModel
 import subprocess
 import asyncio
+import signal
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 BACKEND_DIR  = Path(__file__).parent
@@ -115,10 +116,16 @@ class Job:
         self.lines: List[str] = []
         self.done      = False
         self.success   = False
+        self.cancelled = False
         self.progress  = 0.0
         self.video_path: Optional[str] = None
         self._lock     = threading.Lock()
         self._cursor   = 0
+        self.proc: Optional[subprocess.Popen] = None
+        # NeRF 任务参数，用于精确定位视频文件
+        self.basedir: Optional[str] = None
+        self.expname: Optional[str] = None
+        self.nerf_iters: Optional[int] = None
 
     def add(self, line: str):
         with self._lock:
@@ -136,11 +143,16 @@ jobs: dict[str, Job] = {}
 def _run_job(job: Job, cmd: List[str], cwd: str, mode: str, nerf_iters: int):
     try:
         job.add(f"[启动] {' '.join(cmd)}\n")
+        env = os.environ.copy()
+        env["PYTHONUTF8"]        = "1"
+        env["PYTHONIOENCODING"]  = "utf-8"
         proc = subprocess.Popen(
             cmd, cwd=cwd,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="replace", bufsize=1
+            text=True, encoding="utf-8", errors="replace", bufsize=1,
+            env=env
         )
+        job.proc = proc
 
         sr_weight   = 20.0
         nerf_weight = 70.0
@@ -182,17 +194,38 @@ def _run_job(job: Job, cmd: List[str], cwd: str, mode: str, nerf_iters: int):
                         job.progress = 95.0
 
         proc.wait()
-        job.success  = (proc.returncode == 0)
-        job.progress = 100.0
-        status_txt   = "成功" if job.success else f"失败（返回码 {proc.returncode}）"
-        job.add(f"\n[完成] 处理{status_txt}")
+        if job.cancelled:
+            job.success  = False
+            job.progress = 0.0
+            job.add(f"\n[取消] 运行已被用户终止")
+        else:
+            job.success  = (proc.returncode == 0)
+            job.progress = 100.0
+            status_txt   = "成功" if job.success else f"失败（返回码 {proc.returncode}）"
+            job.add(f"\n[完成] 处理{status_txt}")
 
-        # 寻找生成的视频文件
-        if job.success:
-            output_root = Path(jobs[job.job_id].video_path or "") or Path(cwd)
-            for mp4 in Path(cwd).rglob("*.mp4"):
-                job.video_path = str(mp4)
-                break
+        # 寻找生成的视频文件（精确匹配 NeRF 输出模式）
+        if job.success and job.basedir and job.expname and job.nerf_iters:
+            # NeRF 视频命名格式：{expname}_spiral_{step:06d}_rgb.mp4
+            video_pattern = f"{job.expname}_spiral_{job.nerf_iters:06d}_rgb.mp4"
+            video_dir = Path(job.basedir) / job.expname
+            video_file = video_dir / video_pattern
+            
+            if video_file.exists():
+                job.video_path = str(video_file.resolve()).replace("\\", "/")
+                job.add(f"[视频] 找到视频文件: {job.video_path}")
+            else:
+                # 备用：搜索任意 spiral rgb.mp4
+                found = False
+                if video_dir.exists():
+                    for mp4 in video_dir.glob("*_spiral_*_rgb.mp4"):
+                        job.video_path = str(mp4.resolve()).replace("\\", "/")
+                        job.add(f"[视频] 找到备用视频: {job.video_path}")
+                        found = True
+                        break
+                if not found:
+                    job.add(f"[警告] 未找到视频文件，搜索路径: {video_dir}")
+                    job.add(f"[警告] 期望文件名: {video_pattern}")
 
     except Exception as e:
         job.add(f"[异常] {e}")
@@ -229,6 +262,22 @@ def login(req: LoginReq, db: Session = Depends(get_db)):
     return {"access_token": make_token(user.username), "username": user.username}
 
 # ─── File Browser ─────────────────────────────────────────────────────────────
+def _verify_token_param(token: str = "", db: Session = Depends(get_db)):
+    """SSE/video专用：从 query param 验证 token（EventSource 和 video 标签不支持自定义 header）"""
+    try:
+        payload  = pyjwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username = payload.get("sub")
+        if not username:
+            raise HTTPException(401, "无效令牌")
+    except pyjwt.ExpiredSignatureError:
+        raise HTTPException(401, "令牌已过期")
+    except pyjwt.PyJWTError:
+        raise HTTPException(401, "无效令牌")
+    user = db.query(UserDB).filter(UserDB.username == username).first()
+    if not user:
+        raise HTTPException(401, "用户不存在")
+    return user
+
 @app.get("/files/browse")
 def browse(path: str = "", _u=Depends(current_user)):
     base = Path(path) if path else WORKSPACE
@@ -272,11 +321,12 @@ def preview(path: str, _u=Depends(current_user)):
     return {"images": results}
 
 @app.get("/files/video")
-def serve_video(path: str, _u=Depends(current_user)):
+def serve_video(path: str, _u=Depends(_verify_token_param)):
     vp = Path(path)
     if not vp.exists():
         raise HTTPException(404, "视频文件不存在")
-    return FileResponse(str(vp), media_type="video/mp4")
+    return FileResponse(str(vp), media_type="video/mp4",
+                        headers={"Accept-Ranges": "bytes"})
 
 @app.get("/files/find_video")
 def find_video(path: str, _u=Depends(current_user)):
@@ -320,8 +370,12 @@ async def run_process(req: RunReq, background_tasks: BackgroundTasks, _u=Depends
         if req.mode == "sr_nerf":
             cmd.append("--sr_preprocess")
         
-        # 更新 job 的输出路径为实际使用的 NeRF 路径
-        job.video_path = f"{basedir}/{expname}"
+        # 保存 NeRF 参数以便后续精确定位视频文件（转换为绝对路径）
+        abs_basedir = str((WORKSPACE / basedir).resolve()) if not Path(basedir).is_absolute() else basedir
+        job.basedir = abs_basedir
+        job.expname = expname
+        job.nerf_iters = req.nerf_iters
+        job.video_path = f"{abs_basedir}/{expname}"
     else:
         raise HTTPException(400, "无效的运行模式")
 
@@ -333,6 +387,26 @@ async def run_process(req: RunReq, background_tasks: BackgroundTasks, _u=Depends
     sr_out   = idir if req.mode == "sr_nerf" else (odir if req.mode == "sr" else None)
     nerf_out = f"{basedir}/{expname}" if req.mode in ("nerf", "sr_nerf") else None
     return {"job_id": job_id, "sr_output_path": sr_out, "nerf_output_path": nerf_out}
+
+@app.post("/process/cancel/{job_id}")
+def cancel_process(job_id: str, _u=Depends(current_user)):
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "任务不存在")
+    if job.done:
+        return {"status": "already_done"}
+    job.cancelled = True
+    proc = job.proc
+    if proc and proc.poll() is None:
+        try:
+            # Windows: 强制终止整个进程树（含子进程）
+            subprocess.call(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        except Exception:
+            proc.terminate()
+    return {"status": "cancelled"}
 
 def _pick_config(datadir: str) -> str:
     """Detect blender vs llff and pick an appropriate config."""
@@ -368,22 +442,6 @@ def _parse_config(config_path: str) -> dict:
         pass
     
     return result
-
-def _verify_token_param(token: str = "", db: Session = Depends(get_db)):
-    """SSE专用：从query param验证token（EventSource不支持自定义header）"""
-    try:
-        payload  = pyjwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username = payload.get("sub")
-        if not username:
-            raise HTTPException(401, "无效令牌")
-    except pyjwt.ExpiredSignatureError:
-        raise HTTPException(401, "令牌已过期")
-    except pyjwt.PyJWTError:
-        raise HTTPException(401, "无效令牌")
-    user = db.query(UserDB).filter(UserDB.username == username).first()
-    if not user:
-        raise HTTPException(401, "用户不存在")
-    return user
 
 @app.get("/process/logs/{job_id}")
 async def stream_logs(job_id: str, _u=Depends(_verify_token_param)):

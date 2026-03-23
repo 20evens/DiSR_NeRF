@@ -17,6 +17,9 @@ if errorlevel 1 (
 echo [OK] Conda env: pytorch2023
 echo.
 
+REM --- Set torch model cache to PC user directory ---
+set TORCH_HOME=C:\Users\PC\.cache\torch
+
 REM --- Change to backend directory ---
 cd /d "%~dp0web\backend"
 

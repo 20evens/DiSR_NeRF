@@ -62,6 +62,7 @@ const api = {
   browse:     (path)  => req('GET', `/files/browse?path=${encodeURIComponent(path)}`),
   preview:    (path)  => req('GET', `/files/preview?path=${encodeURIComponent(path)}`),
   findVideo:  (path)  => req('GET', `/files/find_video?path=${encodeURIComponent(path)}`),
+  parseConfig:(path)  => req('GET', `/config/parse?datadir=${encodeURIComponent(path)}`),
   runProcess: (body)  => req('POST', '/process/run', body),
   streamLogs: (id)    => new EventSource(`${BASE}/process/logs/${id}?token=${encodeURIComponent(getToken())}`),
 };
@@ -275,6 +276,7 @@ function Dashboard({ username, onLogout }) {
   const [mode,       setMode]      = useState('sr_nerf');
   const [inputDir,   setInputDir]  = useState('');
   const [outputDir,  setOutDir]    = useState('');
+  const [srOutDir,   setSrOutDir]  = useState('');
   const [autoOut,    setAutoOut]   = useState(true);
   const [advOpen,    setAdvOpen]   = useState(false);
   const [ddimSteps,  setDdim]      = useState(10);
@@ -301,12 +303,20 @@ function Dashboard({ username, onLogout }) {
   // Cleanup SSE
   useEffect(()=>()=>esRef.current?.close(),[]);
 
-  // Auto output path
+  // Auto output path - 从配置文件获取 SR 路径和 NeRF 路径
   useEffect(()=>{
-    if(autoOut && inputDir) {
+    if(autoOut && inputDir && (mode==='nerf' || mode==='sr_nerf')) {
+      api.parseConfig(inputDir)
+        .then(d => {
+          setOutDir(d.nerf_output_path);
+          setSrOutDir(d.sr_output_path || inputDir.replace(/\\/g,'/'));
+        })
+        .catch(() => { setOutDir('./logs/default_exp'); setSrOutDir(inputDir.replace(/\\/g,'/')); });
+    } else if(autoOut && inputDir && mode==='sr') {
       const ts   = new Date().toISOString().slice(0,16).replace('T','_').replace(':','-');
       const base = inputDir.replace(/\\/g,'/').split('/').filter(Boolean).pop() || 'output';
-      setOutDir(`./results/${base}_${mode}_${ts}`);
+      setOutDir(`./results/${base}_sr_${ts}`);
+      setSrOutDir('');
     }
   },[autoOut, inputDir, mode]);
 
@@ -448,20 +458,45 @@ function Dashboard({ username, onLogout }) {
             <PreviewGrid path={inputDir}/>
           </div>
 
-          {/* Output dir */}
-          <div>
-            <label className="block text-xs font-medium text-gray-600 mb-1">结果存放路径</label>
-            <div className="flex gap-2">
-              <input type="text" value={outputDir} onChange={e=>{setOutDir(e.target.value);setAutoOut(false);}} placeholder="选择或输入输出路径…"
-                className="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-indigo-400"/>
-              <button onClick={()=>openBrowser('output')}
-                className="px-3 py-2 border border-gray-300 rounded-lg text-xs hover:bg-gray-50 whitespace-nowrap">📁 浏览</button>
+          {/* Output dir(s) */}
+          {mode==='sr_nerf' ? (
+            <div className="space-y-3">
+              <div>
+                <label className="block text-xs font-medium text-gray-600 mb-1">🔍 超分辨率结果路径 <span className="text-gray-400 font-normal">({'{datadir}/{split}_sr/'})</span></label>
+                <div className="flex gap-2">
+                  <input type="text" value={srOutDir} readOnly
+                    className="flex-1 px-3 py-2 border border-gray-200 rounded-lg text-xs bg-gray-50 text-gray-600 font-mono"/>
+                </div>
+                <p className="text-xs text-gray-400 mt-0.5">SR 图像保存在数据集目录的 train_sr/、val_sr/、test_sr/ 子文件夹中</p>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-600 mb-1">🏗 三维重建结果路径 <span className="text-gray-400 font-normal">({'{basedir}/{expname}/'})</span></label>
+                <div className="flex gap-2">
+                  <input type="text" value={outputDir} readOnly
+                    className="flex-1 px-3 py-2 border border-gray-200 rounded-lg text-xs bg-gray-50 text-gray-600 font-mono"/>
+                </div>
+                <p className="text-xs text-gray-400 mt-0.5">NeRF 模型权重、渲染结果、视频等保存在此目录中</p>
+              </div>
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input type="checkbox" checked={autoOut} onChange={e=>setAutoOut(e.target.checked)} className="accent-indigo-600"/>
+                <span className="text-xs text-gray-500">自动读取配置文件路径（与终端运行一致）</span>
+              </label>
             </div>
-            <label className="flex items-center gap-2 mt-1.5 cursor-pointer">
-              <input type="checkbox" checked={autoOut} onChange={e=>setAutoOut(e.target.checked)} className="accent-indigo-600"/>
-              <span className="text-xs text-gray-500">自动生成路径</span>
-            </label>
-          </div>
+          ) : (
+            <div>
+              <label className="block text-xs font-medium text-gray-600 mb-1">{mode==='sr'?'🔍 超分辨率':'🏗 三维重建'}结果存放路径</label>
+              <div className="flex gap-2">
+                <input type="text" value={outputDir} onChange={e=>{setOutDir(e.target.value);setAutoOut(false);}} placeholder="选择或输入输出路径…"
+                  className="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-indigo-400"/>
+                <button onClick={()=>openBrowser('output')}
+                  className="px-3 py-2 border border-gray-300 rounded-lg text-xs hover:bg-gray-50 whitespace-nowrap">📁 浏览</button>
+              </div>
+              <label className="flex items-center gap-2 mt-1.5 cursor-pointer">
+                <input type="checkbox" checked={autoOut} onChange={e=>setAutoOut(e.target.checked)} className="accent-indigo-600"/>
+                <span className="text-xs text-gray-500">{mode==='nerf'?'自动读取配置文件路径':'自动生成路径'}</span>
+              </label>
+            </div>
+          )}
 
           {/* Start */}
           <button onClick={handleStart} disabled={isRunning}

@@ -13,6 +13,7 @@ nerf_metrics.py - Super-NeRF 评价指标实现
   pip install piq
 """
 
+import warnings
 import numpy as np
 import torch
 
@@ -39,7 +40,9 @@ def compute_lpips_batch(imgs_pred, imgs_gt, device):
         print('[Metrics] lpips 未安装，跳过 LPIPS 计算。请运行: pip install lpips')
         return None
 
-    loss_fn = lpips_lib.LPIPS(net='alex', verbose=False).to(device)
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', category=UserWarning, module='torchvision')
+        loss_fn = lpips_lib.LPIPS(net='alex', verbose=False).to(device)
     loss_fn.eval()
 
     scores = []
@@ -57,33 +60,82 @@ def compute_lpips_batch(imgs_pred, imgs_gt, device):
 # NIQE
 # ──────────────────────────────────────────────────────────────
 
+def _get_niqe_fn():
+    """
+    获取可用的无参考图像质量计算函数，按优先级尝试多种实现：
+      1. pyiqa NIQE
+      2. piq.niqe（函数式）/ piq.NIQE（类式）
+      3. piq.brisque 作为替代无参考指标
+    返回 (fn, metric_name) 或 (None, None)
+    """
+    # 方案1: pyiqa NIQE（最可靠）
+    try:
+        import pyiqa
+        niqe_model = pyiqa.create_metric('niqe', device='cpu')
+        print(f'[Metrics] 使用 pyiqa 计算 NIQE')
+        return lambda t: niqe_model(t).item(), 'NIQE'
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f'[Metrics] pyiqa NIQE 初始化失败: {e}')
+
+    # 方案2: piq NIQE
+    try:
+        import piq
+        if hasattr(piq, 'niqe'):
+            print(f'[Metrics] 使用 piq {piq.__version__} 函数式 API 计算 NIQE')
+            return lambda t: piq.niqe(t, data_range=1.0).item(), 'NIQE'
+        if hasattr(piq, 'NIQE'):
+            niqe_metric = piq.NIQE(data_range=1.0)
+            print(f'[Metrics] 使用 piq {piq.__version__} 类式 API 计算 NIQE')
+            return lambda t: niqe_metric(t).item(), 'NIQE'
+    except ImportError:
+        pass
+
+    # 方案3: piq BRISQUE 作为替代无参考指标
+    try:
+        import piq
+        if hasattr(piq, 'brisque'):
+            print(f'[Metrics] piq {piq.__version__} 不含 NIQE，使用 BRISQUE 作为替代无参考指标')
+            return lambda t: piq.brisque(t, data_range=1.0).item(), 'BRISQUE'
+        if hasattr(piq, 'BRISQUELoss'):
+            brisque_metric = piq.BRISQUELoss(data_range=1.0)
+            print(f'[Metrics] piq {piq.__version__} 不含 NIQE，使用 BRISQUELoss 作为替代无参考指标')
+            return lambda t: brisque_metric(t).item(), 'BRISQUE'
+    except ImportError:
+        pass
+
+    print('[Metrics] 无可用的无参考图像质量指标（NIQE/BRISQUE），跳过计算。')
+    print('[Metrics] 建议运行: pip install pyiqa')
+    return None, None
+
+
 def compute_niqe_batch(imgs):
     """
-    计算批量图像的平均 NIQE 无参考图像质量分数。
+    计算批量图像的平均无参考图像质量分数（NIQE 或 BRISQUE）。
 
     Args:
         imgs: list of np.ndarray [H, W, 3], float32, [0, 1]
 
     Returns:
-        float: 平均 NIQE（越低越好），若库未安装返回 None
+        (float, str): (平均分数, 指标名称)，越低越好；若无可用实现返回 (None, None)
     """
-    try:
-        import piq
-    except ImportError:
-        print('[Metrics] piq 未安装，跳过 NIQE 计算。请运行: pip install piq')
-        return None
+    niqe_fn, metric_name = _get_niqe_fn()
+    if niqe_fn is None:
+        return None, None
 
     scores = []
     with torch.no_grad():
         for img in imgs:
             t = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).float().clamp(0.0, 1.0)
             try:
-                score = piq.niqe(t, data_range=1.0).item()
+                score = niqe_fn(t)
                 scores.append(score)
             except Exception as e:
-                print(f'[Metrics] NIQE 单张计算异常（已跳过）: {e}')
+                print(f'[Metrics] {metric_name} 单张计算异常（已跳过）: {e}')
 
-    return float(np.mean(scores)) if scores else None
+    mean_score = float(np.mean(scores)) if scores else None
+    return mean_score, metric_name
 
 
 # ──────────────────────────────────────────────────────────────
@@ -107,9 +159,11 @@ def evaluate_nerf_metrics(rgbs, gt_imgs=None, device='cuda', save_path=None):
     """
     imgs_pred = [np.clip(rgbs[i].astype(np.float32), 0.0, 1.0) for i in range(len(rgbs))]
 
-    # ── NIQE（无参考） ──────────────────────────────────────
-    print('[Metrics] 计算 NIQE（无参考图像质量）...')
-    niqe_score = compute_niqe_batch(imgs_pred)
+    # ── 无参考图像质量（NIQE 或 BRISQUE） ────────────────────
+    print('[Metrics] 计算无参考图像质量指标...')
+    niqe_score, nr_metric_name = compute_niqe_batch(imgs_pred)
+    if nr_metric_name is None:
+        nr_metric_name = 'NIQE'
 
     # ── LPIPS（需要参考图像） ───────────────────────────────
     lpips_score = None
@@ -130,13 +184,13 @@ def evaluate_nerf_metrics(rgbs, gt_imgs=None, device='cuda', save_path=None):
     print(' Super-NeRF 评价指标结果')
     print(f'{"=" * 55}')
     if lpips_score is not None:
-        print(f'  LPIPS  (感知一致性，↓ 越低越好): {lpips_score:.4f}')
+        print(f'  LPIPS    (感知一致性，↓ 越低越好): {lpips_score:.4f}')
     else:
-        print('  LPIPS: 未计算（无参考图像）')
+        print('  LPIPS:   未计算（无参考图像）')
     if niqe_score is not None:
-        print(f'  NIQE   (无参考图像质量，↓ 越低越好): {niqe_score:.4f}')
+        print(f'  {nr_metric_name:<8s} (无参考图像质量，↓ 越低越好): {niqe_score:.4f}')
     else:
-        print('  NIQE:  未计算')
+        print(f'  {nr_metric_name}:  未计算')
     print(f'{"=" * 55}\n')
 
     # ── 保存到文件 ─────────────────────────────────────────
@@ -155,7 +209,7 @@ def evaluate_nerf_metrics(rgbs, gt_imgs=None, device='cuda', save_path=None):
             else:
                 f.write('  未计算（无参考图像，符合 Super-NeRF 无真实HR评估场景）\n\n')
 
-            f.write('[NIQE] 无参考图像质量（越低越好）\n')
+            f.write(f'[{nr_metric_name}] 无参考图像质量（越低越好）\n')
             if niqe_score is not None:
                 f.write(f'  值: {niqe_score:.6f}\n')
                 f.write('  说明: 反映生成图像细节对人类视觉感知的可接受程度，无需参考图像。\n')
@@ -164,4 +218,4 @@ def evaluate_nerf_metrics(rgbs, gt_imgs=None, device='cuda', save_path=None):
 
         print(f'[Metrics] 指标已保存至: {save_path}')
 
-    return {'lpips': lpips_score, 'niqe': niqe_score}
+    return {'lpips': lpips_score, nr_metric_name.lower(): niqe_score}

@@ -756,6 +756,11 @@ def train():
     # 创建实验目录和保存配置
     basedir = args.basedir
     expname = args.expname
+    
+    # half_res 时自动添加 _half 后缀区分输出路径
+    if args.half_res and not expname.endswith('_half'):
+        expname = expname + '_half'
+    
     os.makedirs(os.path.join(basedir, expname), exist_ok=True)
     f = os.path.join(basedir, expname, 'args.txt')
     with open(f, 'w') as file:
@@ -771,6 +776,17 @@ def train():
     render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
     global_step = start
 
+    # 训练已完成时自动切换为 render_only 模式
+    # 注意：checkpoint 保存的是当前步数，训练循环会从 start+1 开始
+    N_iters_target = 200000
+    if start + 1 >= N_iters_target and not args.render_only:
+        print(f'\n{"="*60}')
+        print(f'[训练完成] 检查点步数 {start}，下一步将是 {start+1} >= 目标步数 {N_iters_target}')
+        print(f'[训练完成] 自动切换为 render_only + render_test 模式')
+        print(f'{"="*60}\n')
+        args.render_only = True
+        args.render_test = True
+
     bds_dict = {
         'near' : near,
         'far' : far,
@@ -784,30 +800,90 @@ def train():
     # 仅渲染模式
     if args.render_only:
         print('RENDER ONLY')
-        with torch.no_grad():
-            if args.render_test:
-                # 测试
-                images = images[i_test]
+        if args.render_test:
+            # 测试
+            images = images[i_test]
+        else:
+            # 认情况下，渲染姿势路径更平滑
+            images = None
+
+        # render_test 时对齐训练循环的路径格式 testset_{i}，i = start+1
+        step = start + 1
+        if args.render_test:
+            testsavedir = os.path.join(basedir, expname, 'testset_{:06d}'.format(step))
+        else:
+            testsavedir = os.path.join(basedir, expname, 'renderonly_path_{:06d}'.format(step))
+        os.makedirs(testsavedir, exist_ok=True)
+
+        # 视频路径与训练循环保持一致：{expname}_spiral_{step:06d}_rgb.mp4
+        moviebase = os.path.join(basedir, expname, '{}_spiral_{:06d}_'.format(expname, step))
+        video_path = moviebase + 'rgb.mp4'
+
+        # 检测已有渲染结果：PNG 文件数量是否与待渲染视角数一致
+        existing_pngs = sorted([f for f in os.listdir(testsavedir) if f.endswith('.png')])
+        n_target = len(render_poses) if images is None else len(images)
+
+        print(f'\n{"="*60}')
+        print(f'[渲染检测] 输出目录: {testsavedir}')
+        print(f'[渲染检测] 目标视角数: {n_target}')
+        print(f'[渲染检测] 已有PNG文件: {len(existing_pngs)}')
+        print(f'{"="*60}\n')
+
+        if len(existing_pngs) >= n_target:
+            # 已有渲染结果，跳过渲染，直接加载
+            print(f'[跳过渲染] 发现足够的渲染图像 ({len(existing_pngs)}/{n_target})')
+            print(f'[跳过渲染] 从磁盘加载已有图像...')
+            rgbs = np.stack([
+                imageio.imread(os.path.join(testsavedir, f)).astype(np.float32) / 255.0
+                for f in existing_pngs[:n_target]
+            ], 0)
+            print(f'[跳过渲染] 成功加载 {len(rgbs)} 张图像')
+            
+            if not os.path.exists(video_path):
+                print(f'[视频生成] 从已有图像生成视频...')
+                imageio.mimwrite(video_path, to8b(rgbs), fps=30, quality=8)
+                print(f'[视频生成] 已保存: {video_path}')
             else:
-                # 认情况下，渲染姿势路径更平滑
-                images = None
+                print(f'[视频生成] 视频已存在，跳过: {video_path}')
+        else:
+            # 无已有结果，执行渲染
+            print(f'[开始渲染] 图像不足 ({len(existing_pngs)}/{n_target})，开始渲染...')
+            print(f'[开始渲染] 测试位姿形状: {render_poses.shape}')
+            with torch.no_grad():
+                rgbs, _ = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test, gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
+            print(f'[渲染完成] 已保存 {len(rgbs)} 张图像至: {testsavedir}')
+            print(f'[视频生成] 生成视频中...')
+            imageio.mimwrite(video_path, to8b(rgbs), fps=30, quality=8)
+            print(f'[视频生成] 已保存: {video_path}')
 
-            testsavedir = os.path.join(basedir, expname, 'renderonly_{}_{:06d}'.format('test' if args.render_test else 'path', start))
-            os.makedirs(testsavedir, exist_ok=True)
-            print('test poses shape', render_poses.shape)
+        # Super-NeRF 评价指标（LPIPS + NIQE）
+        metrics_path = os.path.join(basedir, expname, 'metrics.txt')
 
-            rgbs, _ = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test, gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
-            print('Done rendering', testsavedir)
-            imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
-            # Super-NeRF 评价指标（LPIPS + NIQE）
+        def _metrics_complete(path):
+            """检测 metrics.txt 是否包含真实计算结果（含 '值:' 字段）"""
+            try:
+                with open(path, 'r', encoding='utf-8') as _f:
+                    return '值:' in _f.read()
+            except Exception:
+                return False
+
+        if _metrics_complete(metrics_path):
+            print(f'\n[跳过指标计算] metrics.txt 已含有效数据，跳过 LPIPS/NIQE 计算')
+            print(f'[跳过指标计算] 已有指标文件: {metrics_path}')
+        else:
+            if os.path.exists(metrics_path):
+                print(f'\n[开始指标计算] metrics.txt 存在但数据不完整，重新计算 LPIPS/NIQE...')
+            else:
+                print(f'\n[开始指标计算] 计算 LPIPS / NIQE 指标...')
             evaluate_nerf_metrics(
                 rgbs,
                 gt_imgs=images,
                 device=device,
-                save_path=os.path.join(testsavedir, 'metrics.txt')
+                save_path=metrics_path
             )
+            print(f'[指标计算完成] 结果已保存至: {metrics_path}')
 
-            return
+        return
 
     # 如果要对随机射线进行批处理，准备射线批处理张量
     N_rand = args.N_rand

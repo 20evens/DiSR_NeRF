@@ -1,0 +1,44 @@
+python run_nerf.py --config configs/lego.txt
+python run_nerf.py --config configs/flower.txt
+
+python train.py --config config.py
+
+# 使用 final_model.pth（默认）
+python test.py
+ 
+# 指定其他检查点
+python test.py --checkpoint ./checkpoints/best_model.pth
+python test.py --checkpoint ./checkpoints/checkpoint_epoch_100.pth
+
+# 默认：使用 final_model.pth，输出 3024×3024
+python test_full.py
+
+# 指定检查点
+python test_full.py --checkpoint ./checkpoints/best_model.pth
+
+# 只保存4x结果（1512×1512，跳过双三次插值）
+python test_full.py --no_bicubic
+
+# 先只测试前2张（速度慢，先验证）
+python test_full.py --max_images 2
+
+# 方式1：一键 超分辨率 + 三维重建
+python run_nerf.py --config configs/fern_sr.txt
+python run_nerf.py --config configs/flower_sr.txt
+python run_nerf.py --config configs/lego_sr.txt
+
+# 方式2：指定扩散模型检查点
+python run_nerf.py --config configs/fern_sr.txt --sr_checkpoint ./checkpoints/best_model.pth
+
+# 方式3：单独运行超分辨率（带颜色校正）
+python test_full.py --input_dir ./data/nerf_llff_data/fern/images_8 --output_dir ./data/nerf_llff_data/fern/images_sr
+
+python train.py
+
+python test_full.py --max_images 1 --no_bicubic
+
+python run_nerf.py --config configs/lego_half_sr.txt
+
+# LPIPS在 0~1 的范围内，0.07 属于非常低的水平，说明你的超分辨率结果在纹理、结构、细节上与真实高分辨率图像极为接近，人眼很难分辨差异。作为对比，常见 NeRF 超分方法在相同数据集上 LPIPS 通常在 0.09~0.12 之间，0.07 表明感知质量显著优于多数基线。
+
+# NIQE 是无参考指标，评估图像的自然度（是否像真实照片）。数值越低表示图像越自然，一般真实图像的 NIQE 在 3~6 之间。NIQE大于7之后图像效果较差

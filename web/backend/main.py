@@ -304,27 +304,35 @@ async def run_process(req: RunReq, background_tasks: BackgroundTasks, _u=Depends
                "--input_dir",  idir,
                "--output_dir", odir]
 
-    elif req.mode == "nerf":
+    elif req.mode == "nerf" or req.mode == "sr_nerf":
+        # 从配置文件解析 basedir 和 expname，忽略前端传入的 output_dir
+        cfg_params = _parse_config(cfg)
+        basedir = cfg_params['basedir']
+        expname = cfg_params['expname']
+        
         cmd = [PYTHON_EXE, "run_nerf.py",
                "--config",   cfg,
                "--datadir",  idir,
-               "--basedir",  odir,
+               "--basedir",  basedir,
+               "--expname",  expname,
                "--N_iters",  str(req.nerf_iters)]
-
-    elif req.mode == "sr_nerf":
-        cmd = [PYTHON_EXE, "run_nerf.py",
-               "--config",       cfg,
-               "--datadir",      idir,
-               "--basedir",      odir,
-               "--sr_preprocess",
-               "--N_iters",      str(req.nerf_iters)]
+        
+        if req.mode == "sr_nerf":
+            cmd.append("--sr_preprocess")
+        
+        # 更新 job 的输出路径为实际使用的 NeRF 路径
+        job.video_path = f"{basedir}/{expname}"
     else:
         raise HTTPException(400, "无效的运行模式")
 
     background_tasks.add_task(
         _run_job, job, cmd, cwd, req.mode, req.nerf_iters
     )
-    return {"job_id": job_id}
+
+    # 返回两个独立的输出路径
+    sr_out   = idir if req.mode == "sr_nerf" else (odir if req.mode == "sr" else None)
+    nerf_out = f"{basedir}/{expname}" if req.mode in ("nerf", "sr_nerf") else None
+    return {"job_id": job_id, "sr_output_path": sr_out, "nerf_output_path": nerf_out}
 
 def _pick_config(datadir: str) -> str:
     """Detect blender vs llff and pick an appropriate config."""
@@ -333,6 +341,33 @@ def _pick_config(datadir: str) -> str:
         cfg = WORKSPACE / "configs" / "lego_sr.txt"
         return str(cfg).replace("\\", "/") if cfg.exists() else "configs/lego_sr.txt"
     return "configs/lego.txt"
+
+def _parse_config(config_path: str) -> dict:
+    """解析配置文件，提取 expname 和 basedir"""
+    cfg_file = Path(config_path) if Path(config_path).is_absolute() else WORKSPACE / config_path
+    result = {"expname": "default_exp", "basedir": "./logs"}
+    
+    if not cfg_file.exists():
+        return result
+    
+    try:
+        with open(cfg_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                if '=' in line:
+                    key, val = line.split('=', 1)
+                    key = key.strip()
+                    val = val.strip()
+                    if key == 'expname':
+                        result['expname'] = val
+                    elif key == 'basedir':
+                        result['basedir'] = val
+    except Exception:
+        pass
+    
+    return result
 
 def _verify_token_param(token: str = "", db: Session = Depends(get_db)):
     """SSE专用：从query param验证token（EventSource不支持自定义header）"""
@@ -387,6 +422,23 @@ def job_status(job_id: str, _u=Depends(current_user)):
     j = jobs[job_id]
     return {"done": j.done, "success": j.success, "progress": j.progress,
             "video_path": j.video_path}
+
+@app.get("/config/parse")
+def parse_config_endpoint(datadir: str = "", _u=Depends(current_user)):
+    """解析配置文件，返回 SR 和 NeRF 两个输出路径供前端使用"""
+    cfg = _pick_config(datadir) if datadir else "configs/lego_sr.txt"
+    params = _parse_config(cfg)
+    # SR 结果存放在 {datadir}/{split}_sr/ 目录下
+    sr_path = datadir.replace("\\", "/") if datadir else ""
+    # NeRF 结果存放在 {basedir}/{expname}/ 目录下
+    nerf_path = f"{params['basedir']}/{params['expname']}"
+    return {
+        "config_file": cfg,
+        "expname": params['expname'],
+        "basedir": params['basedir'],
+        "sr_output_path": sr_path,
+        "nerf_output_path": nerf_path,
+    }
 
 @app.get("/health")
 def health():
